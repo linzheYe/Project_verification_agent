@@ -1,0 +1,9 @@
+{
+  "topic_count": 10,
+  "failed_topic_count": 0,
+  "external_urls_enabled": true,
+  "topic_grounding_path": "/home/an/Project_verification_agent/prefetch_data/topics_10/output_with_urls_6/topic_grounding.jsonl",
+  "topic_guidance_path": "/home/an/Project_verification_agent/prefetch_data/topics_10/output_with_urls_6/topic_guidance.jsonl",
+  "fetched_fulltext_path": "/home/an/Project_verification_agent/prefetch_data/topics_10/output_with_urls_6/fetched_fulltext_pages.jsonl",
+  "topic_grounding_trace_path": "/home/an/Project_verification_agent/prefetch_data/topics_10/output_with_urls_6/topic_grounding_trace.jsonl"
+}
