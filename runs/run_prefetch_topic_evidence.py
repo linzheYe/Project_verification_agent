@@ -20,10 +20,10 @@ from scripts.prefetch_topic_evidence_stages import PrefetchStageConfig
 # =========================
 # All paths below are relative to project root: /home/an/Project_verification_agent
 
-INPUT_JSONL = "prefetch_data/topics_30/simpleqa_verified_sample30_final.jsonl"
-OUTPUT_DIR = "prefetch_data/topics_30/output_with_urls_1"
+INPUT_JSONL = "prefetch_data/topics_10/simpleqa_10_urls.jsonl"
+OUTPUT_DIR = "prefetch_data/topics_10/without_urls_2"
 LLM_MODEL = "openai/gpt-5.4-nano"
-USE_INPUT_URLS = True
+USE_INPUT_URLS = False
 ENABLE_TOPIC_PARALLEL = True
 TOPIC_PARALLEL_WORKERS = 10
 PRINT_PROGRESS = True
@@ -33,7 +33,7 @@ OUTPUT_CONFLICT_POLICY = "fail"  # one of: fail, backup, overwrite
 #  - overwrite: 不做保护，直接用新结果覆盖同名文件。
 
 QUERY_FIELD = "problem" # primary field name to read query text
-QUERY_FIELD_FALLBACKS = ["query"] # fallback field names if primary field is missing/empty
+QUERY_FIELD_FALLBACKS = ["simpleqa_problem"] # fallback field names if primary field is missing/empty
 TOPIC_ID_FIELD = "original_index"
 URL_FIELD = "urls"
 REQUIRE_TOPIC_ID_FROM_INPUT = True
