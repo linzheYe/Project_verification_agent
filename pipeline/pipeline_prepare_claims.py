@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,7 @@ from scripts.claim_topic_registry import SplitClaimRegistry
 
 
 class FatalPrepareClaimsError(RuntimeError):
-    """Fatal connectivity error that should stop the whole prepare-claims run."""
+    """Reserved for truly unrecoverable prepare-stage failures."""
 
 
 class PrepareClaimsPipeline:
@@ -60,53 +61,63 @@ class PrepareClaimsPipeline:
         )
 
     @staticmethod
-    def _is_fatal_connectivity_error(error: Exception) -> bool:
-        if isinstance(error, LLMConnectivityError):
-            return True
-        msg = str(error).lower()
-        fatal_signals = [
-            "unable to connect to proxy",
-            "proxyerror",
-            "failed to establish a new connection",
-            "connection refused",
-            "max retries exceeded",
-            "openrouter_request_error",
-            "remote end closed connection without response",
-        ]
-        return any(x in msg for x in fatal_signals)
-
-    def _raise_if_fatal_connectivity_error(self, error: Exception, *, stage: str) -> None:
-        if self._is_fatal_connectivity_error(error):
-            raise FatalPrepareClaimsError(f"{stage}_fatal_connectivity_error: {error}") from error
+    def _ts() -> str:
+        return time.strftime("%Y-%m-%d %H:%M:%S")
 
     def run_clean_stage(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """执行 clean：model_answer -> cleaned_model_answer。"""
         out_rows: list[dict[str, Any]] = []
 
         for rec in records:
+            sample = rec.get("sample") or {}
+            sample_id = str(sample.get("id") or "").strip()
+            query = str(sample.get("query") or "").strip()
             out_model_outputs: dict[str, dict[str, Any]] = {}
             for seq_key, model_output in self._iter_model_outputs(rec):
                 model_answer = str(model_output.get("model_answer") or "").strip()
+                model_sequence_id = int(model_output.get("model_sequence_id") or 0)
+                model_name = str(model_output.get("model_name") or "")
                 item: dict[str, Any] = {
-                    "model_sequence_id": int(model_output.get("model_sequence_id") or 0),
-                    "model_name": str(model_output.get("model_name") or ""),
+                    "model_sequence_id": model_sequence_id,
+                    "model_name": model_name,
+                    "raw_model_answer": model_answer,
                     "cleaned_model_answer": "",
                 }
 
                 if not model_answer:
                     item["error"] = "empty_model_answer"
+                    print(
+                        f"[{self._ts()}] [prepare:clean:skip] sample_id={sample_id} seq={model_sequence_id} "
+                        f"model={model_name} reason=empty_model_answer",
+                        flush=True,
+                    )
                 else:
                     try:
+                        print(
+                            f"[{self._ts()}] [prepare:clean:llm:start] sample_id={sample_id} seq={model_sequence_id} "
+                            f"model={model_name} query={query[:120]!r} answer_chars={len(model_answer)}",
+                            flush=True,
+                        )
+                        t0 = time.perf_counter()
                         system_prompt, user_prompt = build_clean_prompt(model_answer)
                         raw = self.llm.call(system_prompt, user_prompt, temperature=0.2)
                         parsed = parse_json_object(raw)
-                        cleaned = str(parsed.get("cleaned_response") or "").strip()
-                        if not cleaned:
+                        if "cleaned_response" not in parsed:
                             raise ValueError("cleaned_response missing")
+                        cleaned = str(parsed.get("cleaned_response") or "").strip()
                         item["cleaned_model_answer"] = cleaned
+                        print(
+                            f"[{self._ts()}] [prepare:clean:llm:done] sample_id={sample_id} seq={model_sequence_id} "
+                            f"model={model_name} elapsed={time.perf_counter() - t0:.2f}s cleaned_chars={len(cleaned)}",
+                            flush=True,
+                        )
                     except Exception as e:
-                        self._raise_if_fatal_connectivity_error(e, stage="clean")
                         item["error"] = f"clean_error: {e}"
+                        print(
+                            f"[{self._ts()}] [prepare:clean:llm:error] sample_id={sample_id} seq={model_sequence_id} "
+                            f"model={model_name} error={e}",
+                            flush=True,
+                        )
 
                 out_model_outputs[seq_key] = item
 
@@ -123,29 +134,58 @@ class PrepareClaimsPipeline:
 
         for rec in clean_rows:
             sample_key = self._sample_key(rec)
+            sample = rec.get("sample") or {}
+            sample_id = str(sample.get("id") or "").strip()
+            query = str(sample.get("query") or "").strip()
             split_registry = SplitClaimRegistry()
 
             out_model_outputs: dict[str, dict[str, Any]] = {}
             for seq_key, model_output in self._iter_model_outputs(rec):
                 model_sequence_id = int(model_output.get("model_sequence_id") or 0)
+                raw_model_answer = str(model_output.get("raw_model_answer") or "").strip()
                 cleaned_text = str(model_output.get("cleaned_model_answer") or "").strip()
+                model_name = str(model_output.get("model_name") or "")
                 item: dict[str, Any] = {
                     "model_sequence_id": model_sequence_id,
-                    "model_name": str(model_output.get("model_name") or ""),
+                    "model_name": model_name,
+                    "raw_model_answer": raw_model_answer,
+                    "cleaned_model_answer": cleaned_text,
                     "atomic_claims": [],
                 }
 
                 if not cleaned_text:
-                    item["error"] = model_output.get("error", "empty_cleaned_model_answer")
+                    upstream_error = str(model_output.get("error") or "").strip()
+                    if upstream_error:
+                        item["error"] = upstream_error
+                    print(
+                        f"[{self._ts()}] [prepare:split:skip] sample_id={sample_id} seq={model_sequence_id} "
+                        f"model={model_name} reason={upstream_error or 'empty_cleaned_model_answer'}",
+                        flush=True,
+                    )
                 else:
                     try:
+                        print(
+                            f"[{self._ts()}] [prepare:split:llm:start] sample_id={sample_id} seq={model_sequence_id} "
+                            f"model={model_name} query={query[:120]!r} cleaned_chars={len(cleaned_text)}",
+                            flush=True,
+                        )
+                        t0 = time.perf_counter()
                         system_prompt, user_prompt = build_split_prompt(cleaned_text)
                         raw = self.llm.call(system_prompt, user_prompt, temperature=0.5)
                         claims = parse_atomic_claim_lines(raw)
                         item["atomic_claims"] = split_registry.add_model_claims(model_sequence_id, claims)
+                        print(
+                            f"[{self._ts()}] [prepare:split:llm:done] sample_id={sample_id} seq={model_sequence_id} "
+                            f"model={model_name} elapsed={time.perf_counter() - t0:.2f}s claims={len(item['atomic_claims'])}",
+                            flush=True,
+                        )
                     except Exception as e:
-                        self._raise_if_fatal_connectivity_error(e, stage="split")
                         item["error"] = f"split_error: {e}"
+                        print(
+                            f"[{self._ts()}] [prepare:split:llm:error] sample_id={sample_id} seq={model_sequence_id} "
+                            f"model={model_name} error={e}",
+                            flush=True,
+                        )
 
                 out_model_outputs[seq_key] = item
 
@@ -183,7 +223,9 @@ class PrepareClaimsPipeline:
                 claim_refs = split_registry.get_claims_for_model(model_sequence_id)
                 claim_texts = [c.atomic_claim for c in claim_refs]
                 if not claim_texts:
-                    item["error"] = model_output.get("error", "empty_atomic_claims")
+                    upstream_error = str(model_output.get("error") or "").strip()
+                    if upstream_error:
+                        item["error"] = upstream_error
                     out_model_outputs[seq_key] = item
                     continue
 

@@ -17,6 +17,7 @@ from scripts.evidence_registry import (
 from scripts.llm_api import LLMClient, LLMConnectivityError
 from scripts.prompt_template import (
     FACTUAL_LABEL,
+    NEI_LABEL,
     NON_FACTUAL_LABEL,
     build_must_have_answer_prompt,
     build_next_search_or_answer_prompt,
@@ -407,11 +408,11 @@ class EvidenceRetrievePipeline:
                         "The previous attempt failed due to parse/schema issues. "
                         "Read last_step_feedback and retry now. "
                         "Return only valid JSON object with keys: "
-                        "final_answer, reason, evidence_snippet_ids."
+                        "final_answer, reasoning, evidence_snippet_ids."
                     ),
                     "format_instruction": (
                         "Return only valid JSON object with keys: "
-                        "final_answer, reason, evidence_snippet_ids."
+                        "final_answer, reasoning, evidence_snippet_ids."
                     ),
                     "previous_raw_output": (last_raw or "")[:2000],
                 }
@@ -453,7 +454,7 @@ class EvidenceRetrievePipeline:
                 self._inc_count("must_answer_retry_exhausted")
                 status.set_error((status.error + " | " if status.error else "") + f"must_answer_error: {e}")
                 status.finalize_answer(
-                    final_answer=NON_FACTUAL_LABEL,
+                    final_answer=NEI_LABEL,
                     final_reason="insufficient or invalid structured answer from MUST_HAVE_ANSWER",
                     evidence_snippet_ids=[],
                     finished_by_max_round=True,
@@ -565,6 +566,8 @@ class EvidenceRetrievePipeline:
             # Backward compatibility: old prompt/schema used `reason`.
             if not missing_fact_to_verify:
                 missing_fact_to_verify = str(obj.get("reason") or "").strip()
+            if not missing_fact_to_verify:
+                missing_fact_to_verify = str(obj.get("reasoning") or "").strip()
             if not search_query:
                 raise ValueError("next_action_missing_search_query")
             return {
@@ -576,6 +579,8 @@ class EvidenceRetrievePipeline:
         if action == "answer":
             final_answer = str(obj.get("final_answer") or "").strip()
             reason = str(obj.get("reason") or "").strip()
+            if not reason:
+                reason = str(obj.get("reasoning") or "").strip()
             evidence_snippet_ids = obj.get("evidence_snippet_ids") or []
             if final_answer not in {FACTUAL_LABEL, NON_FACTUAL_LABEL}:
                 raise ValueError("next_action_invalid_final_answer")
@@ -592,6 +597,7 @@ class EvidenceRetrievePipeline:
         """Parse MUST_HAVE_ANSWER output into a normalized answer payload."""
         # Compatible with both schemas:
         # - {"final_answer":..., "reason":..., "evidence_snippet_ids":[...]}
+        # - {"final_answer":..., "reasoning":..., "evidence_snippet_ids":[...]}
         # - {"action":"answer", ...}
         action = str(obj.get("action") or "").strip().lower()
         if action and action != "answer":
@@ -599,8 +605,10 @@ class EvidenceRetrievePipeline:
 
         final_answer = str(obj.get("final_answer") or "").strip()
         reason = str(obj.get("reason") or "").strip()
+        if not reason:
+            reason = str(obj.get("reasoning") or "").strip()
         evidence_snippet_ids = obj.get("evidence_snippet_ids") or []
-        if final_answer not in {FACTUAL_LABEL, NON_FACTUAL_LABEL}:
+        if final_answer not in {FACTUAL_LABEL, NON_FACTUAL_LABEL, NEI_LABEL}:
             raise ValueError("must_answer_invalid_final_answer")
 
         return {

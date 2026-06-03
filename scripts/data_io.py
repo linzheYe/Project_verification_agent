@@ -5,6 +5,12 @@ import re
 from pathlib import Path
 from typing import Any
 
+VALID_FINAL_ANSWER_LABELS = {
+    "SUPPORTED",
+    "REFUTED",
+    "NOT_ENOUGH_INFORMATION",
+}
+
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     """读取 JSONL 文件，返回对象列表。"""
@@ -190,13 +196,17 @@ def _extract_answer_like_fields(text: str) -> dict[str, Any]:
     if final_pos < 0:
         raise ValueError("final_answer_not_found_in_text")
     final_answer = _parse_value_token(raw, final_pos).strip().upper()
-    if final_answer not in {"SUPPORTED", "REFUTED"}:
-        raise ValueError("final_answer_not_supported_or_refuted")
+    if final_answer not in VALID_FINAL_ANSWER_LABELS:
+        raise ValueError("final_answer_not_in_valid_label_set")
 
     reason = ""
     reason_pos = _find_key_value_anchor(raw, "reason")
     if reason_pos >= 0:
         reason = _parse_value_token(raw, reason_pos).strip()
+    if not reason:
+        reasoning_pos = _find_key_value_anchor(raw, "reasoning")
+        if reasoning_pos >= 0:
+            reason = _parse_value_token(raw, reasoning_pos).strip()
 
     evidence_ids = re.findall(r"\bS\d+\b", raw, flags=re.IGNORECASE)
     evidence_ids = [sid.upper() for sid in evidence_ids]

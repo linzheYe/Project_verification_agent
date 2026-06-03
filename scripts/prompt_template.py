@@ -7,61 +7,72 @@ from typing import Any, Mapping, Sequence
 # retrive
 # rubric
 CLEAN_RESPONSE_SYSTEM_PROMPT_TEMPLATE = """
-Clean and normalize an LLM response while preserving its factual meaning.
+Clean an LLM response. Keep facts and remove conversational noise. This is a cleanup task, not a rewriting task.
 
-Your task is to remove low-value, non-informative, or formulaic text, and rewrite the remaining content into clear, complete, self-contained statements.
+Follow these steps:
 
-Remove expressions such as:
-- Simple confirmations, such as "Yes," "Correct," or "Sure."
-- Generic lead-ins, such as "The information is as follows" or "Here are the details."
-- Empty transition phrases, such as "Specifically," "In particular," or "It should be noted that."
-- Summary fillers, such as "In summary" or "Overall."
-- Any other generic wording that does not add factual content.
+1. Keep factual information.
+- Keep every factual statement from the input.
+- Keep names, dates, numbers, titles, and technical terms as written.
+- Keep factual information even when it appears inside text that should otherwise be removed.
 
-Rules:
-- Preserve all factual information from the input.
-- Do not add facts that are not present in the input.
-- Do not change dates, numbers, names, titles, entities, or technical terms.
-- If the input contains incomplete fragments, labels, headings, or bullet-style fields, rewrite them as complete sentences when the missing sentence structure can be inferred from the local context.
-- If a fragment cannot be completed without guessing, keep it concise but do not invent missing information.
-- Remove duplicated content.
-- Keep the cleaned text in the same language as the input.
-- Return only valid JSON.
-- Do not add explanations, markdown, comments, or extra fields.
+2. Remove noise.
+- Remove introductory phrases that do not add information.
+- Remove text saying the model is unsure, does not know, cannot answer, or does not want to guess.
+- Remove text telling the user to check other sources.
+- Remove questions to the user.
+- Remove text about what the user may know, think, mean, find, or want.
+  Examples: "You may be thinking of...", "Maybe you mean...", "You may want to know...", "If you read ..., you will find ...".
+- Remove content that is almost exactly repeated.
 
-Return the result using exactly this schema:
+3. Adjust wording only when needed.
+- Keep the original wording when it is already clear.
+- Prefer deletion over rewriting.
+- Rewrite only when labels, fields, fragments, or bullet points need to become a complete sentence.
+- Rewrite only when removing text would leave an incomplete sentence.
+- Do not add facts.
+- Do not lose any factual information.
 
+Do not:
+- Add facts.
+- Summarize.
+- Rewrite facts unless necessary.
+- Make uncertain wording sound more certain.
+- Remove factual information because it seems repetitive.
+
+If no factual information remains, return an empty string.
+
+
+Return only valid JSON using exactly this schema:
 {
   "cleaned_response": "cleaned response text"
 }
 
-Example 1:
-Input:
-Sure. Here are the details: Tesla reported revenue of $96.8 billion in 2023. Specifically, its automotive revenue was $82.4 billion.
-Output:
-{
-  "cleaned_response": "Tesla reported revenue of $96.8 billion in 2023. Its automotive revenue was $82.4 billion."
-}
+Example:
 
-Example 2:
 Input:
-Details:
 Selection batch: Third batch
 Selection date: June 8, 2011
+
 Output:
 {
   "cleaned_response": "The item was selected in the third batch, with a selection date of June 8, 2011."
 }
 
-Example 3:
 Input:
-Brief conclusion:
-The policy coverage expanded.
-Covered entities: small and medium-sized enterprises.
-Implementation date: January 2024.
+I don't have confident information about the specific city where the conference started. I'd recommend checking official sources.
+
 Output:
 {
-  "cleaned_response": "The policy coverage expanded to include small and medium-sized enterprises, with an implementation date of January 2024."
+  "cleaned_response": ""
+}
+
+Input:
+I'm not confident enough to name a specific EP. In 2019, Rosalía was primarily releasing singles like "Con Altura" (with J Balvin) and "Aute Cuture."
+
+Output:
+{
+  "cleaned_response": "In 2019, Rosalía was primarily releasing singles like \\"Con Altura\\" (with J Balvin) and \\"Aute Cuture.\\""
 }
 
 Return only valid JSON in the required schema.
@@ -326,21 +337,21 @@ def build_group_prompt(claims: Sequence[str], prior_topic_map: Mapping[str, str]
 
 
 SNIPPET_FILTER_SYSTEM_PROMPT_TEMPLATE = """
-Your task is to filter current_round_snippets based on the claim, topic, and non_evidence_context.
+Your task is to filter current_round_snippets based on the claim, topic, and response_context.
 
 Inputs:
 - claim: The atomic claim currently being verified.
 - topic: The topic group that the claim belongs to.
-- non_evidence_context: Context for disambiguation only. Its factual correctness is unknown.
+- response_context: Context for disambiguation only. Its factual correctness is unknown.
 - current_round_snippets: Search result snippets from the current retrieval round. Each snippet contains candidate_id, url, title, and content.
 
 Outputs:
-- evidence_pool_candidate_ids: Snippet IDs that match the same context as the non_evidence_context, are relevant to the topic, and are worth adding to the topic evidence pool.
+- evidence_pool_candidate_ids: Snippet IDs that match the same context as the response_context, are relevant to the topic, and are worth adding to the topic evidence pool.
 - direct_relevant_candidate_ids: A subset of evidence_pool_candidate_ids that can directly support, refute, or qualify the current claim.
 
 Filtering rules:
-1. Retain only snippets that match the entity, event, work, location, or context of the non_evidence_context, claim, and topic. Discard the rest.
-2. Add snippet to evidence_pool_candidate_ids if it: (a) shares the same object as the non_evidence_context and the claim (content/opinion needn't match), (b) is topic-relevant, (c) may help verify claims under this topic.
+1. Retain only snippets that match the entity, event, work, location, or context of the response_context, claim, and topic. Discard the rest.
+2. Add snippet to evidence_pool_candidate_ids if it: (a) shares the same object as the response_context and the claim (content/opinion needn't match), (b) is topic-relevant, (c) may help verify claims under this topic.
 3. Add snippet to direct_relevant_candidate_ids if it is already in evidence_pool_candidate_ids and directly supports, refutes, or qualifies the current claim.
 
 
@@ -365,8 +376,8 @@ claim:
 topic:
 {topic}
 
-non_evidence_context:
-{non_evidence_context}
+response_context:
+{response_context}
 
 current_round_snippets:
 {current_round_snippets}
@@ -375,87 +386,119 @@ current_round_snippets:
 
 
 NEXT_SEARCH_OR_ANSWER_SYSTEM_PROMPT_TEMPLATE = """
-You are provided with a claim, non_evidence_context, present_snippets, and previous_searched_queries. 
+You are provided with a TARGET_CLAIM, response_context (the original response containing TARGET_CLAIM), present_snippets, previous_searched_queries, and topic_guidance_for_search.
 
-Your task is to decide whether present_snippets are sufficient to verify the claim, or whether another search query is needed. if you thimk you still need more evience, raise another search query. 
+**Task**:
+Your task is to decide whether you should answer or return a search query. Answer only if present_snippets directly support all factual elements in the TARGET_CLAIM or directly contradict at least one; if anything is missing or uncertain in the TARGET_CLAIM, generate another search query.
 
-You are also provided with topic_guidance_for_search, which is generated from previously collected evidence and can be treated as reliable guidance. It contains core background or information that may support or refute the claim. Use it to guide your reasoning and decisions.
-
-**CRITICAL: non_evidence_context is NOT evidence.**  
-It only helps identify the correct entity. Do NOT cite it as a fact, do NOT say "according to non_evidence_context", and do NOT use it to justify any part of the claim. All factual support must come from present_snippets. 
+**Evidence boundaries**:
+- present_snippets are the evidence that has been collected so far. Use it to support your decision.
+- topic_guidance_for_search is reliable guidance generated from previously collected evidence. Use it to understand the topic and guide your decision.
+- CRITICAL: response_context is NOT evidence. Use it only to identify the correct entity. Never cite it, refer to it, or use it to justify any part of the TARGET_CLAIM.
 
 
 ## Step 1 — Decide if present_snippets are sufficient
-Use your basic logic and common sense.
-You may answer only if present_snippets and topic_guidance_for_search contain **direct evidence** that:
-- Supports **all** parts of the claim → answer `{factual_label}`
-- Contradicts even only one part of the claim → answer `{non_factual_label}`
+Before deciding, identify **ALL** factual elements in the TARGET_CLAIM: exact entity, relation/property, and claimed factual content.
 
-**Don't count something as evidence if:**
-- The snippet is missing the exact name, number, date, location, or role you need.
-- The snippet says something broader or related, but not exactly what the claim says.
-- You have to assume, infer, or fill in missing info to make it fit.
+### Decision rules
+Use present_snippets and topic_guidance_for_search as factual evidence. Compare the claim against the evidence element by element, and keep this question in mind: does the evidence state the same thing, state a different thing, or fail to state it?
+- Full direct support for all factual elements → `{factual_label}`
+- Direct contradiction of any factual element → `{non_factual_label}`
+- Incomplete, vague, indirect, or uncertain evidence without direct contradiction → generate a search query
 
-If you're not sure and think there is no enough evidence — or if the snippet only talks about a different attribute or a vaguely related topic — do NOT answer. Instead, generate a search query.
+Partial support is not enough for `{factual_label}`. A different value for the same exact entity and relation is a direct contradiction.
+
+**IMPORTANT**:Be highly cautious with `{factual_label}`. Re-check it as if it may be wrong: every factual element must be directly supported, with no missing or contradictory part.
+
+### Common errors to avoid in Step 1
+**Example 1: animal mismatch despite matched descriptor**  
+TARGET_CLAIM: The crest depicts a wolf rampant argent.  
+Snippet evidence: "The crest depicts a stag rampant argent."  
+Element check: "rampant argent" matches, but the animal does not: the claim requires wolf, while the snippet states stag.  
+Decision: `{non_factual_label}`.
+
+**Example 2: animal mismatch despite matched action**  
+TARGET_CLAIM: The term regardant means the tiger is looking backward.  
+Snippet evidence: "The crest shows an eagle regardant, meaning looking backward."  
+Element check: "looking backward" matches, but the animal does not: the claim requires tiger, while the snippet states eagle.  
+Decision: `{non_factual_label}`.
+
+**Example 3: specific person missing despite related setting**  
+TARGET_CLAIM: The dispute between Henry Cole and Martin Avery occurred in front of Sir William Harcourt.  
+Snippet evidence: "Henry Cole accused Martin Avery during a hearing in the presence of local magistrates."  
+Element check: the hearing setting is related, but the named person is missing: the claim requires Sir William Harcourt, while the snippet only says "local magistrates."  
+Decision: generate a search query.
+
 
 ## Step 2 — Generate a Search Query If Needed
-If Step 1 does not provide enough direct evidence to answer, identify the missing information based on present_snippets and topic_guidance_for_search, then create one keyword-style Google search query to find that missing detail.
-Guidelines:
-- Use the main entity plus the specific detail being verified.
-- Check present_snippets, previous_searched_queries, and topic_guidance_for_search before generating a query.
-- Do not combine multiple unrelated missing facts into one query.
+If Step 1 does not provide enough direct evidence to verify ALL factual elements in the TARGET_CLAIM, identify the missing factual element and create one keyword-style Google search query for it. Use the fewest words needed for retrieval.
 
-Avoid repeated queries:
-- Do not make only minor wording changes to a previous query.
-- Bad: My Love album released 2002; My Love released 2002 release date; My Love release date 2002.
-- If the same information is still needed, change the search strategy:
-  - Broader: My Love album release year
-  - More specific: My Love album Alexander singer release year 2002
-Examples:
-claim example1: Mutsumi Tamura is known for the role of Bojji in Ranking of Kings.
-search query: Mutsumi Tamura role Bojji Ranking of Kings
-claim example2: Mia Serafino's character Mia worked George Nakai.
-search query: Beef Mia work George Nakai 
+**Query rules:**
+- Use core keywords only: names, nouns, domain terms, and target values. Remove extra context and low-value verbs such as “means”, “signifies”, “represents”, “occurred”, or “refers to”.
+- Search only the missing factual element, not the whole TARGET_CLAIM. Do not add unnecessary known details just because they appear in the claim.
+- Do not mix separate missing facts in one query.
+- If a similar query was already tried, shorten it to core names or terms instead of rephrasing it.
 
 
-OUTPUT FORMAT:
+**Examples:**
+TARGET_CLAIM: Mutsumi Tamura is known for the role of Bojji in Ranking of Kings.
+search query: Mutsumi Tamura Bojji Ranking of Kings
+
+TARGET_CLAIM: Mia Serafino's character Mia worked for George Nakai in TV series Beef.
+search query: Mia George Nakai Beef  
+
+TARGET_CLAIM: The family crest depicts a falcon displayed Proper, meaning the falcon is shown in its natural colors.
+search query: heraldry Proper natural colors
+
+TARGET_CLAIM: House Loglas has a wolf argent on its shield, in heraldry meaning the wolf is silver.
+Do not search “argent silver wolf shield.” Search one fact at a time, do not mix separate missing facts in one query: “heraldry argent silver” or “House Loglas shield wolf.”
+
+TARGET_CLAIM: In medical terminology, "chronic cough in children" means the cough lasts a long time.
+Do not search `medical terminology chronic cough in children lasts long time`.
+Search `medical terminology chronic long lasting`; the intended missing fact is the meaning of "chronic"; "children" is irrelevant to it.
+
+
+## OUTPUT FORMAT:
 Return only valid JSON. Do not include explanations, markdown, comments, or extra fields.
-When returning an answer, use exactly this JSON schema:
+- **When returning an answer, use exactly this JSON schema:**
 {{
   "action": "answer",
-  "final_answer": "{factual_label} or {non_factual_label}",
-  "reason": "Snippet S1 states that XXX joined the xxx Club in 1982, which is clearly contradictory to the year 1985 in the claim.",
-  "evidence_snippet_ids": ["snippet_id"]
+  "reasoning": "Snippet S1 states that XXX joined the xxx Club in 1982, while the TARGET_CLAIM requires 1985, so this is {non_factual_label}. S2 supports the person and club, but partial support is not enough.",
+  "evidence_snippet_ids": ["S1"],
+  "final_answer": "{non_factual_label}"
 }}
 
-When returning a search query, use exactly this JSON schema:
+- **When returning a search query, use exactly this JSON schema:**
 {{
   "action": "search",
-  "search_query": "concise keyword-style search query intended to find needed information"
+  "search_query": "Use the fewest words needed for retrieval"
 }}
 """.strip()
 
 
 NEXT_SEARCH_OR_ANSWER_USER_PROMPT_TEMPLATE = """
-claim:
+
+TASK:
+Decide whether to answer now or generate another search query. Answer only on full direct support or direct contradiction; otherwise search.
+
+
+IMPORTANT:
+Be highly cautious with `{factual_label}`. Re-check it as if it may be wrong: every factual element must be directly supported, with no missing, different, or contradictory part. Do not replace a named entity in the TARGET_CLAIM with a related entity from the evidence.
+
+TARGET_CLAIM:
 {claim}
 
-non_evidence_context:
-{non_evidence_context}
+response_context:
+{response_context}
 
 topic_guidance_for_search:
 {topic_guidance}
 
+previous_searched_queries:
+{previous_searched_queries}
 
 present_snippets_with_ids:
 {present_snippets_with_ids}
-
-
-previous_searched_queries:
-{searched_queries}
-
-
-{last_step_feedback_block}
 """.strip()
 
 # below are for pre fetch before dealing with llm responses.
@@ -587,50 +630,62 @@ fetched_pages_with_url_id:
 
 
 MUST_HAVE_ANSWER_SYSTEM_PROMPT_TEMPLATE = """
-You are provided with a claim, non_evidence_context, and present_snippets.
-You are also provided with topic_guidance_for_search, which is generated from previously collected evidence and can be treated as reliable guidance. It contains core background or information that may support or refute the claim. Use it to guide your reasoning and decisions.
+You are provided with:
 
-You cannot perform any more searches. You must return a final answer ({factual_label} or {non_factual_label}) based only on present_snippets.
+* TARGET_CLAIM
+* response_context (the original response containing TARGET_CLAIM)
+* present_snippets
+* topic_guidance_for_search
 
-**CRITICAL**: non_evidence_context is NOT evidence. Use it only to identify the correct entity. Never use it to justify a fact. All factual support must come from present_snippets.
+## Task
+Based on the present_snippets and topic_guidance_for_search, you should return a final answer: `{factual_label}`, `{non_factual_label}`, or `{nei_label}`.
 
-## Step — Decide the answer based on present_snippets
-Use your basic logic and common sense.
-You may only return `{factual_label}` if present_snippets contain **direct evidence** that supports **all** parts of the claim.
-You must return `{non_factual_label}` if:
-- present_snippets contain direct evidence that contradicts even only one part of the claim, OR
-- present_snippets do NOT provide direct evidence to support all parts of the claim (i.e., evidence missing, vague, off‑topic, or only related information).
+## Evidence boundaries
+- present_snippets are the evidence that has been collected. Use it to support your decision.
+- topic_guidance_for_search is reliable guidance generated from previously collected evidence. Use it to understand the topic and guide your reasoning.
+- response_context is NOT evidence. Use it only to identify the correct entity. Never use it to justify any part of the TARGET_CLAIM.
 
-**Don't count something as evidence if:**
-- The snippet is missing the exact name, number, date, location, or role you need.
-- The snippet says something broader or related, but not exactly what the claim says.
-- You have to assume, infer, or fill in missing info to make it fit.
+## Decision rules
+Before deciding, identify all factual elements in the TARGET_CLAIM.
+
+Return `{factual_label}` only if present_snippets directly support every facual elements in the TARGET_CLAIM.
+
+Return `{non_factual_label}` only if present_snippets directly contradict at least one factual elements. If the TARGET_CLAIM requires one value but present_snippets state a different value for the same subject and relation, this is a contradiction, you should return `{non_factual_label}`.
+
+Return `{nei_label}` if present_snippets do not directly support every key factual element and do not directly contradict any key factual element. This includes cases where evidence is missing, vague, off-topic, only indirectly related, or requires inference. 
+
+Missing evidence is not contradiction.
+
+## Common error to avoid:
+TARGET_CLAIM: The crest depicts a wolf rampant argent.
+Snippet evidence: "The crest depicts a stag rampant argent."
+Do NOT answer {factual_label} by saying the snippet matches "rampant argent." The required animal is different: wolf ≠ stag. This is {non_factual_label}.
 
 
 ## Output format
 When returning `{factual_label}`, `evidence_snippet_ids` must contain the IDs of snippets that directly support your reason.
 Return only valid JSON. Do not include explanations, markdown, comments, or extra fields.
 {{
-  "final_answer": "{factual_label} or {non_factual_label}",
-  "reason": "short reason based only on present_snippets. Must quote exact snippet text and show all reasoning steps derived from snippets. If any part of the claim cannot be fully determined from snippets, explicitly state that gap.",
-  "evidence_snippet_ids": ["snippet_id"]
+  "reasoning": "short reason based only on present_snippets. Must quote exact snippet text and show all reasoning steps derived from snippets. If any part of the TARGET_CLAIM cannot be fully determined from snippets, explicitly state that gap.",
+  "evidence_snippet_ids": ["snippet_id"],
+  "final_answer": "{factual_label} or {non_factual_label} or {nei_label}"
 }}
 
 Example:
 {{
-  "final_answer": "{factual_label}",
-  "reason": "Snippet S1 states that XXX joined the xxx Club in 1982, which is clearly contradictory to the year 1985 in the claim.",
-  "evidence_snippet_ids": ["S1"]
+  "reasoning": "Snippet S1 states that XXX joined the xxx Club in 1982, which is clearly contradictory to the year 1985 in the TARGET_CLAIM.",
+  "evidence_snippet_ids": ["S1"],
+  "final_answer": "{non_factual_label}"
 }}
 """.strip()
 
 
 MUST_HAVE_ANSWER_USER_PROMPT_TEMPLATE = """
-claim:
+TARGET_CLAIM:
 {claim}
 
-non_evidence_context:
-{non_evidence_context}
+response_context:
+{response_context}
 
 topic_guidance_for_search:
 {topic_guidance}
@@ -642,7 +697,7 @@ present_snippets_with_ids:
 # Evidence retrieval field names used by prompt builders.
 FIELD_CLAIM = "claim"
 FIELD_TOPIC = "topic"
-FIELD_DISAMBIGUATION_TEXT = "non_evidence_context"
+FIELD_DISAMBIGUATION_TEXT = "response_context"
 # Backward-compat alias for older callers.
 FIELD_BACKGROUND_TEXT = "background_text"
 FIELD_CURRENT_ROUND_SNIPPETS = "current_round_snippets"
@@ -657,6 +712,7 @@ FIELD_DO_NOT_REPEAT_QUERIES = "do_not_repeat_queries"
 # Unified verdict labels for retrieval stage.
 FACTUAL_LABEL = "SUPPORTED"
 NON_FACTUAL_LABEL = "REFUTED"
+NEI_LABEL = "NOT_ENOUGH_INFORMATION"
 
 
 def _get_disambiguation_text(payload: Mapping[str, Any]) -> str:
@@ -673,19 +729,19 @@ def build_snippet_filter_prompt(snippet_filter_input: Mapping[str, Any]) -> tupl
     Required input fields:
     - claim: str
     - topic: str
-    - non_evidence_context: str
+    - response_context: str
     - current_round_snippets: list[dict] with candidate_id/url/title/content
     """
     claim = str(snippet_filter_input.get(FIELD_CLAIM) or "").strip()
     topic = str(snippet_filter_input.get(FIELD_TOPIC) or "").strip()
-    non_evidence_context = _get_disambiguation_text(snippet_filter_input)
+    response_context = _get_disambiguation_text(snippet_filter_input)
     current_round_snippets = snippet_filter_input.get(FIELD_CURRENT_ROUND_SNIPPETS) or []
 
     snippets_json = json.dumps(list(current_round_snippets), ensure_ascii=False, indent=2)
     user_prompt = SNIPPET_FILTER_USER_PROMPT_TEMPLATE.format(
         claim=claim,
         topic=topic,
-        non_evidence_context=non_evidence_context,
+        response_context=response_context,
         current_round_snippets=snippets_json,
     )
     return SNIPPET_FILTER_SYSTEM_PROMPT_TEMPLATE, user_prompt
@@ -696,12 +752,12 @@ def build_next_search_or_answer_prompt(next_input: Mapping[str, Any]) -> tuple[s
 
     Required input fields:
     - claim: str
-    - non_evidence_context: str
+    - response_context: str
     - searched_queries: list[str]
     - present_snippets_with_ids: list[dict] with snippet_id/url/title/content
     """
     claim = str(next_input.get(FIELD_CLAIM) or "").strip()
-    non_evidence_context = _get_disambiguation_text(next_input)
+    response_context = _get_disambiguation_text(next_input)
     searched_queries = next_input.get(FIELD_SEARCHED_QUERIES) or []
     present_snippets_with_ids = next_input.get(FIELD_PRESENT_SNIPPETS_WITH_IDS) or []
     last_error_type = str(next_input.get(FIELD_LAST_ERROR_TYPE) or "").strip()
@@ -738,9 +794,10 @@ def build_next_search_or_answer_prompt(next_input: Mapping[str, Any]) -> tuple[s
     )
     user_prompt = NEXT_SEARCH_OR_ANSWER_USER_PROMPT_TEMPLATE.format(
         claim=claim,
-        non_evidence_context=non_evidence_context,
+        factual_label=FACTUAL_LABEL,
+        response_context=response_context,
         topic_guidance=topic_guidance,
-        searched_queries=json.dumps(list(searched_queries), ensure_ascii=False, indent=2),
+        previous_searched_queries=json.dumps(list(searched_queries), ensure_ascii=False, indent=2),
         last_step_feedback_block=last_step_feedback_block,
         present_snippets_with_ids=json.dumps(
             list(present_snippets_with_ids),
@@ -804,21 +861,22 @@ def build_must_have_answer_prompt(must_input: Mapping[str, Any]) -> tuple[str, s
 
     Required input fields:
     - claim: str
-    - non_evidence_context: str
+    - response_context: str
     - present_snippets_with_ids: list[dict] with snippet_id/url/title/content
     """
     claim = str(must_input.get(FIELD_CLAIM) or "").strip()
-    non_evidence_context = _get_disambiguation_text(must_input)
+    response_context = _get_disambiguation_text(must_input)
     topic_guidance = str(must_input.get("topic_guidance") or "").strip()
     present_snippets_with_ids = must_input.get(FIELD_PRESENT_SNIPPETS_WITH_IDS) or []
 
     system_prompt = MUST_HAVE_ANSWER_SYSTEM_PROMPT_TEMPLATE.format(
         factual_label=FACTUAL_LABEL,
         non_factual_label=NON_FACTUAL_LABEL,
+        nei_label=NEI_LABEL,
     )
     user_prompt = MUST_HAVE_ANSWER_USER_PROMPT_TEMPLATE.format(
         claim=claim,
-        non_evidence_context=non_evidence_context,
+        response_context=response_context,
         topic_guidance=topic_guidance,
         present_snippets_with_ids=json.dumps(
             list(present_snippets_with_ids),
