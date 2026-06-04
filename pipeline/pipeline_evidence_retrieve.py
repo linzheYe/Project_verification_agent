@@ -13,6 +13,7 @@ from scripts.evidence_registry import (
     ClaimSnippetStatus,
     QuestionEvidencePoolRegistry,
     filter_non_duplicate_snippets_by_content,
+    rank_snippets_by_bm25,
 )
 from scripts.llm_api import LLMClient, LLMConnectivityError
 from scripts.prompt_template import (
@@ -60,6 +61,8 @@ class EvidenceRetrievePipeline:
         no_progress_defer_threshold: int = 2,
         top_k_freq_snippets: int = 5,
         query_cache_jaccard_threshold: float = 0.8,
+        enable_fixed_topic_grounding_evidence: bool = False,
+        enable_filter_dataset_snippets: bool = False,
         topic_grounding_path: Path | None = None,
         topic_guidance_path: Path | None = None,
     ) -> None:
@@ -84,6 +87,8 @@ class EvidenceRetrievePipeline:
         self.no_progress_defer_threshold = max(1, int(no_progress_defer_threshold))
         self.top_k_freq_snippets = max(1, int(top_k_freq_snippets))
         self.query_cache_jaccard_threshold = max(0.0, min(1.0, float(query_cache_jaccard_threshold)))
+        self.enable_fixed_topic_grounding_evidence = bool(enable_fixed_topic_grounding_evidence)
+        self.enable_filter_dataset_snippets = bool(enable_filter_dataset_snippets)
         self.topic_grounding_path = topic_grounding_path
         self.topic_guidance_path = topic_guidance_path
 
@@ -170,12 +175,15 @@ class EvidenceRetrievePipeline:
 
     @staticmethod
     def _snippet_brief(snippet: dict[str, Any]) -> dict[str, Any]:
-        return {
+        out = {
             "snippet_id": str(snippet.get("snippet_id") or "").strip(),
             "url": str(snippet.get("url") or "").strip(),
             "title": str(snippet.get("title") or "").strip(),
             "content": str(snippet.get("content") or "").strip(),
         }
+        if "is_fixed_topic_evidence" in snippet:
+            out["is_fixed_topic_evidence"] = bool(snippet.get("is_fixed_topic_evidence"))
+        return out
 
     @staticmethod
     def _normalize_query_for_similarity(query: str) -> str:
@@ -251,6 +259,87 @@ class EvidenceRetrievePipeline:
             seen.add(sid)
         return merged
 
+    @staticmethod
+    def _split_fixed_topic_snippets(
+        snippets: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        fixed: list[dict[str, Any]] = []
+        regular: list[dict[str, Any]] = []
+        for sn in snippets:
+            if bool((sn or {}).get("is_fixed_topic_evidence")):
+                fixed.append(dict(sn))
+            else:
+                regular.append(dict(sn))
+        return fixed, regular
+
+    def _select_present_snippets_for_claim(
+        self,
+        *,
+        question_key: str,
+        claim_text: str,
+    ) -> list[dict[str, Any]]:
+        pool = self.question_pool_registry.get_question_pool_snippets(question_key)
+        if not self.enable_fixed_topic_grounding_evidence:
+            # Legacy behavior: topic grounding snippets stay inside the same pool
+            # and compete with other snippets for the initial selection budget.
+            if not pool:
+                return []
+            if not self.enable_bm25_initial_select:
+                return [self._snippet_brief(sn) for sn in pool]
+            return [self._snippet_brief(sn) for sn in rank_snippets_by_bm25(
+                claim_text,
+                pool,
+                top_k=max(0, int(self.max_initial_snippets)),
+            )]
+
+        fixed_pool_snippets, regular_pool_snippets = self._split_fixed_topic_snippets(pool)
+
+        if not regular_pool_snippets:
+            regular_selected: list[dict[str, Any]] = []
+        elif not self.enable_bm25_initial_select:
+            regular_selected = [dict(x) for x in regular_pool_snippets]
+        else:
+            regular_selected = rank_snippets_by_bm25(
+                claim_text,
+                regular_pool_snippets,
+                top_k=max(0, int(self.max_initial_snippets)),
+            )
+
+        return self._merge_present_snippets(
+            [self._snippet_brief(sn) for sn in fixed_pool_snippets],
+            [self._snippet_brief(sn) for sn in regular_selected],
+        )
+
+    def _add_fixed_topic_evidence(
+        self,
+        *,
+        question_key: str,
+        present_snippets: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not self.enable_fixed_topic_grounding_evidence:
+            return [dict(x) for x in present_snippets]
+        pool = self.question_pool_registry.get_question_pool_snippets(question_key)
+        fixed_pool_snippets, _ = self._split_fixed_topic_snippets(pool)
+        return self._merge_present_snippets(
+            [self._snippet_brief(sn) for sn in fixed_pool_snippets],
+            [self._snippet_brief(sn) for sn in present_snippets],
+        )
+
+    @staticmethod
+    def _is_dataset_snippet(snippet: dict[str, Any]) -> bool:
+        title = str((snippet or {}).get("title") or "").lower()
+        url = str((snippet or {}).get("url") or "").lower()
+        return "dataset" in title or "dataset" in url
+
+    def _filter_dataset_snippets(
+        self,
+        snippets: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not self.enable_filter_dataset_snippets:
+            return [dict(x) for x in snippets]
+        # Optional hygiene filter for DDG web results only; prefetch topic grounding is untouched.
+        return [dict(x) for x in snippets if not self._is_dataset_snippet(x)]
+
     def _load_prefetch_resources(self) -> None:
         """Load optional prefetch evidence and topic guidance files once per run."""
         self._prefetch_evidence_by_query = {}
@@ -282,6 +371,7 @@ class EvidenceRetrievePipeline:
                             "url": str(ev.get("source_url") or ev.get("url") or "").strip(),
                             "title": str(ev.get("source_title") or ev.get("title") or "").strip(),
                             "content": content,
+                            "is_fixed_topic_evidence": True,
                         }
                     )
                 if snippets:
@@ -465,18 +555,24 @@ class EvidenceRetrievePipeline:
         """Finalize a previously deferred claim using latest question pool."""
         question_key = status.query
         latest_pool = self.question_pool_registry.get_question_pool_snippets(question_key)
-        bm25_seed = self.question_pool_registry.select_initial_snippets_for_claim(
-            question_key,
-            status.claim_text,
-            max_initial_snippets=self.max_initial_snippets,
-            use_bm25=self.enable_bm25_initial_select,
+        bm25_seed = self._select_present_snippets_for_claim(
+            question_key=question_key,
+            claim_text=status.claim_text,
         )
         present_snippets = self._merge_present_snippets(
             [self._snippet_brief(sn) for sn in status.selected_present_snippets],
             [self._snippet_brief(sn) for sn in bm25_seed],
         )
         if not present_snippets:
-            present_snippets = [self._snippet_brief(sn) for sn in latest_pool]
+            present_snippets = self._add_fixed_topic_evidence(
+                question_key=question_key,
+                present_snippets=[self._snippet_brief(sn) for sn in latest_pool],
+            )
+        else:
+            present_snippets = self._add_fixed_topic_evidence(
+                question_key=question_key,
+                present_snippets=present_snippets,
+            )
         status.update_present_snippets(present_snippets)
 
         self._finalize_with_must_answer(
@@ -560,6 +656,8 @@ class EvidenceRetrievePipeline:
     def _parse_next_action(self, obj: dict[str, Any]) -> dict[str, Any]:
         """Parse NEXT_SEARCH_OR_ANSWER action output with explicit validation."""
         action = str(obj.get("action") or "").strip().lower()
+        if not action and str(obj.get("final_answer") or "").strip():
+            action = "answer"
         if action == "search":
             search_query = str(obj.get("search_query") or "").strip()
             missing_fact_to_verify = str(obj.get("missing_fact_to_verify") or "").strip()
@@ -676,11 +774,9 @@ class EvidenceRetrievePipeline:
         )
 
         t0 = time.perf_counter()
-        initial_snippets = self.question_pool_registry.select_initial_snippets_for_claim(
-            question_key,
-            claim_text,
-            max_initial_snippets=self.max_initial_snippets,
-            use_bm25=self.enable_bm25_initial_select,
+        initial_snippets = self._select_present_snippets_for_claim(
+            question_key=question_key,
+            claim_text=claim_text,
         )
         if self.enable_bm25_initial_select:
             self._add_time("bm25_initial_select_seconds", time.perf_counter() - t0)
@@ -759,6 +855,10 @@ class EvidenceRetrievePipeline:
                 if cache_status == "hit_with_direct":
                     cached_direct = [self._snippet_brief(x) for x in (cached.get("direct_snippets") or [])]
                     present_snippets = self._merge_present_snippets(present_snippets, cached_direct)
+                    present_snippets = self._add_fixed_topic_evidence(
+                        question_key=question_key,
+                        present_snippets=present_snippets,
+                    )
                     status.update_present_snippets(present_snippets)
                     status.record_search_round(
                         search_query=search_query,
@@ -792,6 +892,7 @@ class EvidenceRetrievePipeline:
                     search_query,
                     max_results=self.max_snippet_per_search,
                 )
+                raw_snippets = self._filter_dataset_snippets(raw_snippets)
                 self._add_time("ddg_search_seconds", time.perf_counter() - t0)
                 self._inc_count("ddg_search_calls")
             except Exception as e:
@@ -841,16 +942,9 @@ class EvidenceRetrievePipeline:
                 continue
             consecutive_no_result_rounds = 0
 
-            pool_before = self.question_pool_registry.get_question_pool_snippets(question_key)
-            t0 = time.perf_counter()
-            deduped_round_snippets = filter_non_duplicate_snippets_by_content(
-                raw_snippets,
-                pool_before,
-                threshold=self.duplicate_threshold,
-            )
-            self._add_time("snippet_dedup_seconds", time.perf_counter() - t0)
-            self._inc_count("snippet_dedup_calls")
-            candidate_snippets = self._assign_candidate_ids(deduped_round_snippets)
+            # Let the LLM see the full post-filter search results first. Pool dedup
+            # happens only after the model has decided which snippets should enter the pool.
+            candidate_snippets = self._assign_candidate_ids(raw_snippets)
 
             kept_pool_candidate_ids: list[str] = []
             kept_direct_candidate_ids: list[str] = []
@@ -896,8 +990,18 @@ class EvidenceRetrievePipeline:
                 break
 
             candidate_by_id = {str(x["candidate_id"]): x for x in candidate_snippets}
-            pool_candidates = [candidate_by_id[cid] for cid in kept_pool_candidate_ids if cid in candidate_by_id]
+            pool_candidates_pre_dedup = [candidate_by_id[cid] for cid in kept_pool_candidate_ids if cid in candidate_by_id]
             direct_candidates = [candidate_by_id[cid] for cid in kept_direct_candidate_ids if cid in candidate_by_id]
+
+            pool_before = self.question_pool_registry.get_question_pool_snippets(question_key)
+            t0 = time.perf_counter()
+            pool_candidates = filter_non_duplicate_snippets_by_content(
+                pool_candidates_pre_dedup,
+                pool_before,
+                threshold=self.duplicate_threshold,
+            )
+            self._add_time("snippet_dedup_seconds", time.perf_counter() - t0)
+            self._inc_count("snippet_dedup_calls")
 
             added_snippets = self.question_pool_registry.add_snippets_to_question_pool(
                 question_key, pool_candidates
@@ -913,6 +1017,10 @@ class EvidenceRetrievePipeline:
                     new_direct_snippets_with_ids.append(self._snippet_brief(added_map_by_candidate_id[cid]))
 
             present_snippets = self._merge_present_snippets(present_snippets, new_direct_snippets_with_ids)
+            present_snippets = self._add_fixed_topic_evidence(
+                question_key=question_key,
+                present_snippets=present_snippets,
+            )
             status.update_present_snippets(present_snippets)
             status.record_search_round(
                 search_query=search_query,
@@ -997,13 +1105,23 @@ class EvidenceRetrievePipeline:
             for sn in status.selected_present_snippets
             if str(sn.get("snippet_id") or "").strip()
         }
+        cited_snippet_ids: list[str] = []
+        seen_cited_ids: set[str] = set()
+        for sid in list(status.evidence_snippet_ids) + self._extract_rationale_snippet_ids(status.final_reason):
+            sid_norm = str(sid or "").strip().upper()
+            if not sid_norm or sid_norm in seen_cited_ids:
+                continue
+            seen_cited_ids.add(sid_norm)
+            cited_snippet_ids.append(sid_norm)
+
         evidence_snippets = [
             {
+                "snippet_id": sid,
                 "url": str(present_by_id[sid].get("url") or ""),
                 "title": str(present_by_id[sid].get("title") or ""),
                 "content": str(present_by_id[sid].get("content") or ""),
             }
-            for sid in status.evidence_snippet_ids
+            for sid in cited_snippet_ids
             if sid in present_by_id
         ]
         evidence_result_row = {
@@ -1019,6 +1137,7 @@ class EvidenceRetrievePipeline:
             "used_must_have_answer": status.finished_by_max_round,
             "auto_verdict": status.final_answer,
             "verdict_rationale": status.final_reason,
+            "rationale_mentioned_snippet_ids": self._extract_rationale_snippet_ids(status.final_reason),
             "evidence_snippets": evidence_snippets,
             "round_sources": [str(x.get("round_source") or "") for x in status.round_logs],
             "has_query_cache_reuse": any(str(x.get("round_source") or "") == "query_cache_reuse" for x in status.round_logs),
@@ -1102,17 +1221,43 @@ class EvidenceRetrievePipeline:
             qk = status.query
             latest_pool = self.question_pool_registry.get_question_pool_snippets(qk)
             pool_by_id = {str(x.get("snippet_id") or "").strip().upper(): x for x in latest_pool}
-            top_freq = [
-                pool_by_id[sid]
-                for sid in top_freq_ids_by_question.get(qk, [])[: self.top_k_freq_snippets]
-                if sid in pool_by_id
-            ]
-            if top_freq:
-                present = self._merge_present_snippets(
-                    [self._snippet_brief(sn) for sn in top_freq],
-                    [self._snippet_brief(sn) for sn in latest_pool],
-                )
-                status.update_present_snippets(present)
+            if not self.enable_fixed_topic_grounding_evidence:
+                # Legacy behavior: second pass prioritizes high-frequency snippets,
+                # then falls back to the latest full topic evidence pool.
+                top_freq = [
+                    pool_by_id[sid]
+                    for sid in top_freq_ids_by_question.get(qk, [])[: self.top_k_freq_snippets]
+                    if sid in pool_by_id
+                ]
+                if top_freq:
+                    present = self._merge_present_snippets(
+                        [self._snippet_brief(sn) for sn in top_freq],
+                        [self._snippet_brief(sn) for sn in latest_pool],
+                    )
+                    status.update_present_snippets(present)
+            else:
+                top_freq = [
+                    pool_by_id[sid]
+                    for sid in top_freq_ids_by_question.get(qk, [])[: self.top_k_freq_snippets]
+                    if sid in pool_by_id and not bool((pool_by_id[sid] or {}).get("is_fixed_topic_evidence"))
+                ]
+                if top_freq or status.selected_present_snippets:
+                    # Fixed topic grounding is always retained as background context.
+                    # The top-k competition is only among non-fixed retrieval evidence.
+                    existing_non_fixed = [
+                        self._snippet_brief(sn)
+                        for sn in status.selected_present_snippets
+                        if not bool((sn or {}).get("is_fixed_topic_evidence"))
+                    ]
+                    present = self._merge_present_snippets(
+                        existing_non_fixed,
+                        [self._snippet_brief(sn) for sn in top_freq],
+                    )
+                    present = self._add_fixed_topic_evidence(
+                        question_key=qk,
+                        present_snippets=present,
+                    )
+                    status.update_present_snippets(present)
             self._finalize_deferred_error_claim(status)
             claim_status_row, trace_rows, evidence_row = self._build_rows_from_status(status)
             self._append_jsonl_row(self.claim_status_path, claim_status_row)

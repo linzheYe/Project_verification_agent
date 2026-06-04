@@ -393,12 +393,12 @@ Your task is to decide whether you should answer or return a search query. Answe
 
 **Evidence boundaries**:
 - present_snippets are the evidence that has been collected so far. Use it to support your decision.
-- topic_guidance_for_search is reliable guidance generated from previously collected evidence. Use it to understand the topic and guide your decision.
+- topic_guidance_for_search can be used to understand the topic and guide your decision, but it is NOT evidence.
 - CRITICAL: response_context is NOT evidence. Use it only to identify the correct entity. Never cite it, refer to it, or use it to justify any part of the TARGET_CLAIM.
 
 
 ## Step 1 — Decide if present_snippets are sufficient
-Before deciding, identify **ALL** factual elements in the TARGET_CLAIM: exact entity, relation/property, and claimed factual content.
+Before deciding, identify ALL factual elements in TARGET_CLAIM: named person, place, source, date, quote, role, relation, and value. You have to decide whether the evidence support TARGET_CLAIM exactly as written.
 
 ### Decision rules
 Use present_snippets and topic_guidance_for_search as factual evidence. Compare the claim against the evidence element by element, and keep this question in mind: does the evidence state the same thing, state a different thing, or fail to state it?
@@ -408,26 +408,29 @@ Use present_snippets and topic_guidance_for_search as factual evidence. Compare 
 
 Partial support is not enough for `{factual_label}`. A different value for the same exact entity and relation is a direct contradiction.
 
-**IMPORTANT**:Be highly cautious with `{factual_label}`. Re-check it as if it may be wrong: every factual element must be directly supported, with no missing or contradictory part.
+**IMPORTANT**:Be highly cautious with `{factual_label}`. Re-check it as if it may be wrong: every factual element must be directly supported, without any missing or contradictory part.
+
+
+
 
 ### Common errors to avoid in Step 1
-**Example 1: animal mismatch despite matched descriptor**  
-TARGET_CLAIM: The crest depicts a wolf rampant argent.  
-Snippet evidence: "The crest depicts a stag rampant argent."  
-Element check: "rampant argent" matches, but the animal does not: the claim requires wolf, while the snippet states stag.  
+**Example 1: matched description, wrong object**
+TARGET_CLAIM: The crest depicts a wolf rampant argent.
+Snippet evidence: "The crest depicts a stag rampant argent."
+Element check: the description "rampant argent" matches, but the object does not. The claim requires a wolf, while the snippet states a stag.
 Decision: `{non_factual_label}`.
 
-**Example 2: animal mismatch despite matched action**  
-TARGET_CLAIM: The term regardant means the tiger is looking backward.  
-Snippet evidence: "The crest shows an eagle regardant, meaning looking backward."  
-Element check: "looking backward" matches, but the animal does not: the claim requires tiger, while the snippet states eagle.  
-Decision: `{non_factual_label}`.
-
-**Example 3: specific person missing despite related setting**  
-TARGET_CLAIM: The dispute between Henry Cole and Martin Avery occurred in front of Sir William Harcourt.  
-Snippet evidence: "Henry Cole accused Martin Avery during a hearing in the presence of local magistrates."  
-Element check: the hearing setting is related, but the named person is missing: the claim requires Sir William Harcourt, while the snippet only says "local magistrates."  
+**Example 2: event supported, named person missing**
+TARGET_CLAIM: The dispute between Henry Cole and Martin Avery occurred in front of Sir William Harcourt.
+Snippet evidence: "Henry Cole accused Martin Avery during a hearing in the presence of local magistrates."
+Element check: the dispute and setting are related, but the named person is missing. The claim requires Sir William Harcourt, while the snippet only states local magistrates.
 Decision: generate a search query.
+
+**Example 3: date supported, named source contradicted**  
+TARGET_CLAIM: The club notice in The London Gazette is dated April 1824.  
+Snippet evidence: "The club notice was published in The Manchester Courier on 14 April 1824."  
+Element check: the date April 1824 is supported, but the named source is contradicted. The claim requires The London Gazette, while the snippet states The Manchester Courier.  
+Decision: `{non_factual_label}`.
 
 
 ## Step 2 — Generate a Search Query If Needed
@@ -460,13 +463,23 @@ Search `medical terminology chronic long lasting`; the intended missing fact is 
 
 ## OUTPUT FORMAT:
 Return only valid JSON. Do not include explanations, markdown, comments, or extra fields.
-- **When returning an answer, use exactly this JSON schema:**
+
+- **When returning an answer with `{non_factual_label}` label, use exactly this JSON schema:**
 {{
   "action": "answer",
-  "reasoning": "Snippet S1 states that XXX joined the xxx Club in 1982, while the TARGET_CLAIM requires 1985, so this is {non_factual_label}. S2 supports the person and club, but partial support is not enough.",
-  "evidence_snippet_ids": ["S1"],
+  "reasoning": "TARGET_CLAIM requires: person Arthur Bennett, club Riverside Cricket Club, relation joined, date 1985, source The London Gazette. Snippets S1 and S2 state: Arthur Bennett joined Riverside Cricket Club in 1985, and the record was published in The Manchester Courier. The person, club, year and relation match, but the source is The Manchester Courier, not The London Gazette. The named source is directly contradicted, so the answer is {non_factual_label}.",
+  "evidence_snippet_ids": ["S1", "S2"],
   "final_answer": "{non_factual_label}"
 }}
+
+- **When returning an answer with `{factual_label}` label, use exactly this JSON schema:**
+{{
+  "action": "answer",
+  "reasoning": "TARGET_CLAIM requires: person XXX, club xxx Club, relation joined, date 1982. Snippet S1 states the same: XXX joined the xxx Club in 1982. The person, club, relation, and date all match exactly, so the answer is {factual_label}.",
+  "evidence_snippet_ids": ["S1"],
+  "final_answer": "{factual_label}"
+}}
+
 
 - **When returning a search query, use exactly this JSON schema:**
 {{
@@ -475,16 +488,16 @@ Return only valid JSON. Do not include explanations, markdown, comments, or extr
 }}
 """.strip()
 
-
 NEXT_SEARCH_OR_ANSWER_USER_PROMPT_TEMPLATE = """
-
 TASK:
-Decide whether to answer now or generate another search query. Answer only on full direct support or direct contradiction; otherwise search.
-
+Decide whether to answer now or generate another search query.
+Answer only on full direct support or direct contradiction. otherwise search.
 
 IMPORTANT:
-Be highly cautious with `{factual_label}`. Re-check it as if it may be wrong: every factual element must be directly supported, with no missing, different, or contradictory part. Do not replace a named entity in the TARGET_CLAIM with a related entity from the evidence.
+Do not give {factual_label} lightly. Start by assuming TARGET_CLAIM is wrong. Then demand direct evidence for TARGET_CLAIM. In your reasoning, explicitly check every part of TARGET_CLAIM against the evidence.
 
+
+Inputs:
 TARGET_CLAIM:
 {claim}
 
@@ -499,6 +512,10 @@ previous_searched_queries:
 
 present_snippets_with_ids:
 {present_snippets_with_ids}
+
+
+
+
 """.strip()
 
 # below are for pre fetch before dealing with llm responses.
@@ -642,7 +659,7 @@ Based on the present_snippets and topic_guidance_for_search, you should return a
 
 ## Evidence boundaries
 - present_snippets are the evidence that has been collected. Use it to support your decision.
-- topic_guidance_for_search is reliable guidance generated from previously collected evidence. Use it to understand the topic and guide your reasoning.
+- topic_guidance_for_search can be used to understand the topic and guide your decision, but it is NOT evidence.
 - response_context is NOT evidence. Use it only to identify the correct entity. Never use it to justify any part of the TARGET_CLAIM.
 
 ## Decision rules
@@ -671,12 +688,23 @@ Return only valid JSON. Do not include explanations, markdown, comments, or extr
   "final_answer": "{factual_label} or {non_factual_label} or {nei_label}"
 }}
 
-Example:
+Examples:
 {{
-  "reasoning": "Snippet S1 states that XXX joined the xxx Club in 1982, which is clearly contradictory to the year 1985 in the TARGET_CLAIM.",
-  "evidence_snippet_ids": ["S1"],
+  "action": "answer",
+  "reasoning": "TARGET_CLAIM requires: person Arthur Bennett, club Riverside Cricket Club, relation joined, date 1985, source The London Gazette. Snippets S1 and S2 state: Arthur Bennett joined Riverside Cricket Club in 1985, and the record was published in The Manchester Courier. The person, club, year and relation match, but the source is The Manchester Courier, not The London Gazette. The named source is directly contradicted, so the answer is {non_factual_label}.",
+  "evidence_snippet_ids": ["S1", "S2"],
   "final_answer": "{non_factual_label}"
 }}
+
+{{
+  "action": "answer",
+  "reasoning": "TARGET_CLAIM requires: person XXX, club xxx Club, relation joined, date 1982. Snippet S1 states the same: XXX joined the xxx Club in 1982. The person, club, relation, and date all match exactly, so the answer is {factual_label}.",
+  "evidence_snippet_ids": ["S1"],
+  "final_answer": "{factual_label}"
+}}
+
+
+
 """.strip()
 
 

@@ -223,6 +223,8 @@ class QuestionEvidencePoolRegistry:
                 "title": str((sn or {}).get("title") or "").strip(),
                 "content": content,
             }
+            if "is_fixed_topic_evidence" in (sn or {}):
+                row["is_fixed_topic_evidence"] = bool((sn or {}).get("is_fixed_topic_evidence"))
             pool.append(row)
             added.append(dict(row))
             existing_ids.add(snippet_id.upper())
@@ -420,13 +422,11 @@ def filter_non_duplicate_snippets_by_content(
         if is_dup:
             continue
 
-        kept.append(
-            {
-                "url": str((sn or {}).get("url") or "").strip(),
-                "title": str((sn or {}).get("title") or "").strip(),
-                "content": content,
-            }
-        )
+        kept_row = dict(sn or {})
+        kept_row["url"] = str((sn or {}).get("url") or "").strip()
+        kept_row["title"] = str((sn or {}).get("title") or "").strip()
+        kept_row["content"] = content
+        kept.append(kept_row)
 
     return kept
 

@@ -53,6 +53,8 @@ class SimpleQARunConfig:
     max_must_answer_retries: int
     max_snippet_per_search: int
     max_initial_snippets: int
+    enable_fixed_topic_grounding_evidence: bool
+    enable_filter_dataset_snippets: bool
     enable_bm25_initial_select: bool
     duplicate_threshold: float
     no_result_defer_threshold: int
