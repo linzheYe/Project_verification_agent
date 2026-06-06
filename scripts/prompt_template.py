@@ -334,27 +334,40 @@ def build_group_prompt(claims: Sequence[str], prior_topic_map: Mapping[str, str]
     )
 
 
-
+#- topic: Optional. The topic group that the claim belongs to.
 SNIPPET_FILTER_SYSTEM_PROMPT_TEMPLATE = """
-Your task is to filter current_round_snippets based on the claim, topic, and response_context.
+Your task is to filter current_round_snippets based on the inputs.
+
 
 Inputs:
 - claim: The atomic claim currently being verified.
-- topic: The topic group that the claim belongs to.
-- response_context: Context for disambiguation only. Its factual correctness is unknown.
-- current_round_snippets: Search result snippets from the current retrieval round. Each snippet contains candidate_id, url, title, and content.
+- response_context: The original response that contains TARGET_CLAIM. Use it only to understand what the target claim refers to.
+- current_round_snippets: search result snippets from the latest retrieval round. Each snippet contains candidate_id, url, title, and content.
+- existing_claim_snippets: snippets already collected for verifying this claim. Use them only to judge whether a current-round snippet adds new information.
+
+
 
 Outputs:
-- evidence_pool_candidate_ids: Snippet IDs that match the same context as the response_context, are relevant to the topic, and are worth adding to the topic evidence pool.
-- direct_relevant_candidate_ids: A subset of evidence_pool_candidate_ids that can directly support, refute, or qualify the current claim.
+- evidence_pool_candidate_ids: candidate_ids that can help verify (support or refute) this claim or other claims from response_context.
+- direct_relevant_candidate_ids: A subset of evidence_pool_candidate_ids that directly support, refute, or qualify the claim.
+
 
 Filtering rules:
-1. Retain only snippets that match the entity, event, work, location, or context of the response_context, claim, and topic. Discard the rest.
-2. Add snippet to evidence_pool_candidate_ids if it: (a) shares the same object as the response_context and the claim (content/opinion needn't match), (b) is topic-relevant, (c) may help verify claims under this topic.
-3. Add snippet to direct_relevant_candidate_ids if it is already in evidence_pool_candidate_ids and directly supports, refutes, or qualifies the current claim.
+For each snippet in current_round_snippets:
+
+1. First decide whether it adds useful evidence.
+   Add it to evidence_pool_candidate_ids only if both conditions are met:
+   - It provides factual information that may help verify the claim or closely related claims in response_context.
+   - It adds new information not already covered by existing_claim_snippets, or provides a clearly more direct, reliable, or claim-specific formulation of the same fact.
+
+2. Then decide whether it is directly relevant to the claim.
+   Add it to direct_relevant_candidate_ids only if it directly supports, refutes, or qualifies the claim itself.
+
+Constraint:
+direct_relevant_candidate_ids must be a subset of evidence_pool_candidate_ids.
 
 
-Do not rewrite, translate, summarize, or complete any snippet.
+Do not rewrite, summarize, or complete any snippet.
 Do not invent candidate IDs.
 Return only valid JSON. Do not include explanations, markdown, comments, or extra fields.
 
@@ -365,21 +378,21 @@ Output schema:
 }
 """.strip()
 
-
 SNIPPET_FILTER_USER_PROMPT_TEMPLATE = """
-Process the following input.
+Process the following input. Select evidence_pool_candidate_ids from current_round_snippets, then select direct_relevant_candidate_ids as its subset, using existing_claim_snippets to avoid redundancy.
 
 claim:
 {claim}
-
-topic:
-{topic}
 
 response_context:
 {response_context}
 
 current_round_snippets:
 {current_round_snippets}
+
+existing_claim_snippets:
+{existing_claim_snippets}
+
 """.strip()
 
 
@@ -388,21 +401,20 @@ NEXT_SEARCH_OR_ANSWER_SYSTEM_PROMPT_TEMPLATE = """
 You are provided with:
 - TARGET_CLAIM: the claim that needs to be checked.
 - response_context: the original response containing TARGET_CLAIM. Use it ONLY to understand what TARGET_CLAIM refers to.
-- present_snippets: the evidence collected so far. Use it to decide whether TARGET_CLAIM is supported or contradicted.
-- previous_searched_queries: the search queries already used.
+- search_history: retrieval history by round. Each item contains the round_index, the search_query used in that round, the newly added direct-evidence snippet ids for this claim from that round, and the corresponding snippet contents.
 - topic_guidance_for_search: guidance for understanding the topic.
 
 
 **Task**:
-Your task is to decide whether you should answer or return a search query. Answer only if present_snippets directly support all factual elements in the TARGET_CLAIM or directly contradict at least one; if anything is missing or uncertain in the TARGET_CLAIM, generate another search query.
+Your task is to decide whether you should answer or return a search query. Answer only if the evidence in search_history directly supports all factual elements in the TARGET_CLAIM or directly contradicts at least one; if anything is missing or uncertain in the TARGET_CLAIM, generate another search query.
 
 
 
-## Step 1 — Decide if present_snippets are sufficient
+## Step 1 — Decide if search_history is sufficient
 Before deciding, identify ALL factual elements in TARGET_CLAIM: named person, place, source, date, quote, role, relation, and value. You have to decide whether the evidence support TARGET_CLAIM exactly as written.
 
 ### Decision rules
-Use present_snippets as factual evidence. Compare the claim against the evidence element by element, and keep this question in mind: does the evidence state the same thing, state a different thing, or fail to state it?
+Use the snippets inside search_history as factual evidence. Compare the claim against the evidence element by element, and keep this question in mind: does the evidence state the same thing, state a different thing, or fail to state it? Also use search_history to understand which previous search queries already produced useful direct evidence and which did not, so your next query targets a missing factual element instead of repeating a failed direction.
 - Full direct support for all factual elements → `{factual_label}`
 - Direct contradiction of any factual element → `{non_factual_label}`
 - Incomplete, vague, indirect, or uncertain evidence without direct contradiction → generate a search query
@@ -508,11 +520,10 @@ response_context:
 topic_guidance_for_search:
 {topic_guidance}
 
-previous_searched_queries:
-{previous_searched_queries}
+search_history:
+{search_history}
 
-present_snippets_with_ids:
-{present_snippets_with_ids}
+{last_step_feedback_block}
 
 
 
@@ -766,21 +777,24 @@ def build_snippet_filter_prompt(snippet_filter_input: Mapping[str, Any]) -> tupl
 
     Required input fields:
     - claim: str
-    - topic: str
     - response_context: str
     - current_round_snippets: list[dict] with candidate_id/url/title/content
+
+    Optional input fields:
+    - existing_claim_snippets: list[dict] with snippet_id/url/title/content
     """
     claim = str(snippet_filter_input.get(FIELD_CLAIM) or "").strip()
-    topic = str(snippet_filter_input.get(FIELD_TOPIC) or "").strip()
     response_context = _get_disambiguation_text(snippet_filter_input)
     current_round_snippets = snippet_filter_input.get(FIELD_CURRENT_ROUND_SNIPPETS) or []
+    existing_claim_snippets = snippet_filter_input.get("existing_claim_snippets") or []
 
     snippets_json = json.dumps(list(current_round_snippets), ensure_ascii=False, indent=2)
+    existing_claim_snippets_json = json.dumps(list(existing_claim_snippets), ensure_ascii=False, indent=2)
     user_prompt = SNIPPET_FILTER_USER_PROMPT_TEMPLATE.format(
         claim=claim,
-        topic=topic,
         response_context=response_context,
         current_round_snippets=snippets_json,
+        existing_claim_snippets=existing_claim_snippets_json,
     )
     return SNIPPET_FILTER_SYSTEM_PROMPT_TEMPLATE, user_prompt
 
@@ -791,13 +805,11 @@ def build_next_search_or_answer_prompt(next_input: Mapping[str, Any]) -> tuple[s
     Required input fields:
     - claim: str
     - response_context: str
-    - searched_queries: list[str]
-    - present_snippets_with_ids: list[dict] with snippet_id/url/title/content
+    - search_history: list[dict] with round_index/search_query/newly_added_present_snippet_ids/newly_added_present_snippets
     """
     claim = str(next_input.get(FIELD_CLAIM) or "").strip()
     response_context = _get_disambiguation_text(next_input)
-    searched_queries = next_input.get(FIELD_SEARCHED_QUERIES) or []
-    present_snippets_with_ids = next_input.get(FIELD_PRESENT_SNIPPETS_WITH_IDS) or []
+    search_history = next_input.get("search_history") or []
     last_error_type = str(next_input.get(FIELD_LAST_ERROR_TYPE) or "").strip()
     last_error_message = str(next_input.get(FIELD_LAST_ERROR_MESSAGE) or "").strip()
     failed_query = str(next_input.get(FIELD_FAILED_QUERY) or "").strip()
@@ -835,13 +847,8 @@ def build_next_search_or_answer_prompt(next_input: Mapping[str, Any]) -> tuple[s
         factual_label=FACTUAL_LABEL,
         response_context=response_context,
         topic_guidance=topic_guidance,
-        previous_searched_queries=json.dumps(list(searched_queries), ensure_ascii=False, indent=2),
+        search_history=json.dumps(list(search_history), ensure_ascii=False, indent=2),
         last_step_feedback_block=last_step_feedback_block,
-        present_snippets_with_ids=json.dumps(
-            list(present_snippets_with_ids),
-            ensure_ascii=False,
-            indent=2,
-        ),
     )
     return system_prompt, user_prompt
 

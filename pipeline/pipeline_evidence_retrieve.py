@@ -12,6 +12,7 @@ from scripts.ddg_search import ensure_ddgs_dependency, search_snippets_with_ddg
 from scripts.evidence_registry import (
     ClaimSnippetStatus,
     QuestionEvidencePoolRegistry,
+    find_best_pool_duplicate_by_content,
     filter_non_duplicate_snippets_by_content,
     rank_snippets_by_bm25,
 )
@@ -185,7 +186,21 @@ class EvidenceRetrievePipeline:
         }
         if "is_fixed_topic_evidence" in snippet:
             out["is_fixed_topic_evidence"] = bool(snippet.get("is_fixed_topic_evidence"))
+        if "present_added_round" in snippet:
+            try:
+                out["present_added_round"] = int(snippet.get("present_added_round") or 0)
+            except Exception:
+                out["present_added_round"] = 0
         return out
+
+    @staticmethod
+    def _snippet_brief_without_round(snippet: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "snippet_id": str(snippet.get("snippet_id") or "").strip(),
+            "url": str(snippet.get("url") or "").strip(),
+            "title": str(snippet.get("title") or "").strip(),
+            "content": str(snippet.get("content") or "").strip(),
+        }
 
     @staticmethod
     def _normalize_query_for_similarity(query: str) -> str:
@@ -215,11 +230,16 @@ class EvidenceRetrievePipeline:
         norm = self._normalize_query_for_similarity(search_query)
         if not norm:
             return
+        brief_direct_snippets: list[dict[str, Any]] = []
+        for x in (direct_snippets or []):
+            brief = self._snippet_brief(x)
+            brief.pop("present_added_round", None)
+            brief_direct_snippets.append(brief)
         self._get_query_cache(question_key)[norm] = {
             "norm_query": norm,
             "raw_query": search_query,
             "status": status,  # hit_with_direct | hit_but_empty | pending
-            "direct_snippets": [self._snippet_brief(x) for x in (direct_snippets or [])],
+            "direct_snippets": brief_direct_snippets,
         }
 
     def _find_similar_cached_query(
@@ -245,6 +265,46 @@ class EvidenceRetrievePipeline:
         return out
 
     @staticmethod
+    def _build_search_history_for_next_action(status: ClaimSnippetStatus) -> list[dict[str, Any]]:
+        present_by_id: dict[str, dict[str, Any]] = {}
+        for sn in (status.selected_present_snippets or []):
+            sid = str((sn or {}).get("snippet_id") or "").strip()
+            if not sid or not re.fullmatch(r"S\d+", sid):
+                continue
+            present_by_id[sid] = {
+                "snippet_id": sid,
+                "url": str((sn or {}).get("url") or "").strip(),
+                "title": str((sn or {}).get("title") or "").strip(),
+                "content": str((sn or {}).get("content") or "").strip(),
+            }
+
+        history: list[dict[str, Any]] = []
+        for row in (status.round_logs or []):
+            search_query = str((row or {}).get("search_query") or "").strip()
+            if not search_query:
+                continue
+            valid_ids: list[str] = []
+            valid_snippets: list[dict[str, Any]] = []
+            for raw_sid in ((row or {}).get("direct_relevant_snippet_ids") or []):
+                sid = str(raw_sid or "").strip()
+                if not sid or not re.fullmatch(r"S\d+", sid):
+                    continue
+                snippet = present_by_id.get(sid)
+                if snippet is None:
+                    continue
+                valid_ids.append(sid)
+                valid_snippets.append(dict(snippet))
+            history.append(
+                {
+                    "round_index": int((row or {}).get("round_index") or 0),
+                    "search_query": search_query,
+                    "newly_added_present_snippet_ids": valid_ids,
+                    "newly_added_present_snippets": valid_snippets,
+                }
+            )
+        return history
+
+    @staticmethod
     def _merge_present_snippets(
         current_snippets: list[dict[str, Any]],
         new_snippets: list[dict[str, Any]],
@@ -260,6 +320,19 @@ class EvidenceRetrievePipeline:
             merged.append(dict(sn))
             seen.add(sid)
         return merged
+
+    @staticmethod
+    def _with_present_round(
+        snippets: list[dict[str, Any]],
+        round_index: int,
+    ) -> list[dict[str, Any]]:
+        tagged: list[dict[str, Any]] = []
+        round_value = max(0, int(round_index))
+        for sn in snippets:
+            row = dict(sn)
+            row["present_added_round"] = round_value
+            tagged.append(row)
+        return tagged
 
     @staticmethod
     def _split_fixed_topic_snippets(
@@ -483,7 +556,9 @@ class EvidenceRetrievePipeline:
                     status.query,
                     self._topic_guidance_by_query.get(status.query, ""),
                 ),
-                "present_snippets_with_ids": present_snippets,
+                "present_snippets_with_ids": [
+                    self._snippet_brief_without_round(x) for x in present_snippets
+                ],
             }
         )
 
@@ -778,7 +853,10 @@ class EvidenceRetrievePipeline:
         if self.enable_bm25_initial_select:
             self._add_time("bm25_initial_select_seconds", time.perf_counter() - t0)
             self._inc_count("bm25_initial_select_calls")
-        present_snippets = [self._snippet_brief(sn) for sn in initial_snippets]
+        present_snippets = self._with_present_round(
+            [self._snippet_brief(sn) for sn in initial_snippets],
+            0,
+        )
         status.initialize_retrieval(present_snippets)
 
         # Iterative retrieval loop with early stop.
@@ -796,8 +874,7 @@ class EvidenceRetrievePipeline:
                             question_key,
                             self._topic_guidance_by_query.get(query, ""),
                         ),
-                        "searched_queries": status.searched_queries,
-                        "present_snippets_with_ids": present_snippets,
+                        "search_history": self._build_search_history_for_next_action(status),
                         "last_error_type": last_error_type,
                         "last_error_message": last_error_message,
                         "failed_query": failed_query,
@@ -851,6 +928,10 @@ class EvidenceRetrievePipeline:
                 cache_status = str(cached.get("status") or "")
                 if cache_status == "hit_with_direct":
                     cached_direct = [self._snippet_brief(x) for x in (cached.get("direct_snippets") or [])]
+                    cached_direct = self._with_present_round(
+                        cached_direct,
+                        status.retrieval_round + 1,
+                    )
                     present_snippets = self._merge_present_snippets(present_snippets, cached_direct)
                     present_snippets = self._add_fixed_topic_evidence(
                         question_key=question_key,
@@ -967,6 +1048,9 @@ class EvidenceRetrievePipeline:
                             "topic": question_group_name,
                             "disambiguation_text": background_text,
                             "current_round_snippets": candidate_snippets,
+                            "existing_claim_snippets": [
+                                self._snippet_brief_without_round(x) for x in present_snippets
+                            ],
                         }
                     )
                     filter_obj = self._call_llm_json(filter_sys, filter_user, temperature=0.2, stage="snippet_filter")
@@ -1025,7 +1109,19 @@ class EvidenceRetrievePipeline:
                 cid = str(cand.get("candidate_id") or "")
                 if cid in added_map_by_candidate_id:
                     new_direct_snippets_with_ids.append(self._snippet_brief(added_map_by_candidate_id[cid]))
+                    continue
+                best_existing = find_best_pool_duplicate_by_content(
+                    cand,
+                    pool_before,
+                    threshold=self.duplicate_threshold,
+                )
+                if best_existing is not None:
+                    new_direct_snippets_with_ids.append(self._snippet_brief(best_existing))
 
+            new_direct_snippets_with_ids = self._with_present_round(
+                new_direct_snippets_with_ids,
+                status.retrieval_round + 1,
+            )
             present_snippets = self._merge_present_snippets(present_snippets, new_direct_snippets_with_ids)
             present_snippets = self._add_fixed_topic_evidence(
                 question_key=question_key,

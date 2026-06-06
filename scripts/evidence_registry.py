@@ -645,6 +645,32 @@ def filter_non_duplicate_snippets_by_content(
     return kept
 
 
+def find_best_pool_duplicate_by_content(
+    new_snippet: dict[str, Any],
+    topic_pool_snippets: list[dict[str, Any]],
+    threshold: float = 0.9,
+) -> dict[str, Any] | None:
+    """Return the most similar existing pool snippet when similarity exceeds threshold."""
+    content = str((new_snippet or {}).get("content") or "").strip()
+    if not content:
+        return None
+    token_set = _content_token_set_for_dedup(content)
+    best_match: dict[str, Any] | None = None
+    best_score = threshold
+    for old in topic_pool_snippets:
+        old_content = str((old or {}).get("content") or "").strip()
+        if not old_content:
+            continue
+        score = _jaccard_similarity_by_token_set(
+            token_set,
+            _content_token_set_for_dedup(old_content),
+        )
+        if score > best_score:
+            best_score = score
+            best_match = dict(old)
+    return best_match
+
+
 def _jaccard_similarity_by_content(a: str, b: str) -> float:
     """Jaccard similarity of token sets from two content strings (0.0–1.0)."""
     set_a = _content_token_set_for_dedup(a)
