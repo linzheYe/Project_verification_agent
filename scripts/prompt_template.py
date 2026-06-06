@@ -14,7 +14,7 @@ Follow these steps:
 1. Keep factual information.
 - Keep every factual statement from the input.
 - Keep names, dates, numbers, titles, and technical terms as written.
-- Keep factual information even when it appears inside text that should otherwise be removed.
+- When a noisy sentence contains a fact, keep the fact and remove the noise.
 
 2. Remove noise.
 - Remove introductory phrases that do not add information.
@@ -23,15 +23,14 @@ Follow these steps:
 - Remove questions to the user.
 - Remove text about what the user may know, think, mean, find, or want.
   Examples: "You may be thinking of...", "Maybe you mean...", "You may want to know...", "If you read ..., you will find ...".
-- Remove content that is almost exactly repeated.
+
 
 3. Adjust wording only when needed.
 - Keep the original wording when it is already clear.
 - Prefer deletion over rewriting.
 - Rewrite only when labels, fields, fragments, or bullet points need to become a complete sentence.
 - Rewrite only when removing text would leave an incomplete sentence.
-- Do not add facts.
-- Do not lose any factual information.
+
 
 Do not:
 - Add facts.
@@ -386,22 +385,24 @@ current_round_snippets:
 
 
 NEXT_SEARCH_OR_ANSWER_SYSTEM_PROMPT_TEMPLATE = """
-You are provided with a TARGET_CLAIM, response_context (the original response containing TARGET_CLAIM), present_snippets, previous_searched_queries, and topic_guidance_for_search.
+You are provided with:
+- TARGET_CLAIM: the claim that needs to be checked.
+- response_context: the original response containing TARGET_CLAIM. Use it ONLY to understand what TARGET_CLAIM refers to.
+- present_snippets: the evidence collected so far. Use it to decide whether TARGET_CLAIM is supported or contradicted.
+- previous_searched_queries: the search queries already used.
+- topic_guidance_for_search: guidance for understanding the topic.
+
 
 **Task**:
 Your task is to decide whether you should answer or return a search query. Answer only if present_snippets directly support all factual elements in the TARGET_CLAIM or directly contradict at least one; if anything is missing or uncertain in the TARGET_CLAIM, generate another search query.
 
-**Evidence boundaries**:
-- present_snippets are the evidence that has been collected so far. Use it to support your decision.
-- topic_guidance_for_search can be used to understand the topic and guide your decision, but it is NOT evidence.
-- CRITICAL: response_context is NOT evidence. Use it only to identify the correct entity. Never cite it, refer to it, or use it to justify any part of the TARGET_CLAIM.
 
 
 ## Step 1 — Decide if present_snippets are sufficient
 Before deciding, identify ALL factual elements in TARGET_CLAIM: named person, place, source, date, quote, role, relation, and value. You have to decide whether the evidence support TARGET_CLAIM exactly as written.
 
 ### Decision rules
-Use present_snippets and topic_guidance_for_search as factual evidence. Compare the claim against the evidence element by element, and keep this question in mind: does the evidence state the same thing, state a different thing, or fail to state it?
+Use present_snippets as factual evidence. Compare the claim against the evidence element by element, and keep this question in mind: does the evidence state the same thing, state a different thing, or fail to state it?
 - Full direct support for all factual elements → `{factual_label}`
 - Direct contradiction of any factual element → `{non_factual_label}`
 - Incomplete, vague, indirect, or uncertain evidence without direct contradiction → generate a search query
@@ -648,30 +649,26 @@ fetched_pages_with_url_id:
 
 MUST_HAVE_ANSWER_SYSTEM_PROMPT_TEMPLATE = """
 You are provided with:
-
-* TARGET_CLAIM
-* response_context (the original response containing TARGET_CLAIM)
-* present_snippets
-* topic_guidance_for_search
+- TARGET_CLAIM: the claim that needs to be checked.
+- response_context: the original response containing TARGET_CLAIM. Use it ONLY to understand what TARGET_CLAIM refers to.
+- present_snippets: the evidence collected so far. Use it to decide whether TARGET_CLAIM is supported or contradicted.
+- topic_guidance_for_search: guidance for understanding the topic.
 
 ## Task
-Based on the present_snippets and topic_guidance_for_search, you should return a final answer: `{factual_label}`, `{non_factual_label}`, or `{nei_label}`.
+Based on the present_snippets, you should return a final answer: `{factual_label}`, `{non_factual_label}`, or `{nei_label}`.
 
-## Evidence boundaries
-- present_snippets are the evidence that has been collected. Use it to support your decision.
-- topic_guidance_for_search can be used to understand the topic and guide your decision, but it is NOT evidence.
-- response_context is NOT evidence. Use it only to identify the correct entity. Never use it to justify any part of the TARGET_CLAIM.
 
 ## Decision rules
 Before deciding, identify all factual elements in the TARGET_CLAIM.
 
-Return `{factual_label}` only if present_snippets directly support every facual elements in the TARGET_CLAIM.
+Return `{factual_label}` only if present_snippets directly support every factual elements in the TARGET_CLAIM.
 
-Return `{non_factual_label}` only if present_snippets directly contradict at least one factual elements. If the TARGET_CLAIM requires one value but present_snippets state a different value for the same subject and relation, this is a contradiction, you should return `{non_factual_label}`.
+Return `{non_factual_label}` if:
+- present_snippets directly contradict at least one factual elements in TARGET_CLAIM. 
+- present_snippets have reached the right area of evidence for TARGET_CLAIM, but at least one detail in the claim is still not directly supported. This includes cases where support is missing, vague, only indirectly related, or requires inference.
 
-Return `{nei_label}` if present_snippets do not directly support every key factual element and do not directly contradict any key factual element. This includes cases where evidence is missing, vague, off-topic, only indirectly related, or requires inference. 
+Return `{nei_label}` only if present_snippets have not reached the right area of evidence, such as when they discuss another entity, another event, another term, or another relation. 
 
-Missing evidence is not contradiction.
 
 ## Common error to avoid:
 TARGET_CLAIM: The crest depicts a wolf rampant argent.
@@ -691,19 +688,32 @@ Return only valid JSON. Do not include explanations, markdown, comments, or extr
 Examples:
 {{
   "action": "answer",
-  "reasoning": "TARGET_CLAIM requires: person Arthur Bennett, club Riverside Cricket Club, relation joined, date 1985, source The London Gazette. Snippets S1 and S2 state: Arthur Bennett joined Riverside Cricket Club in 1985, and the record was published in The Manchester Courier. The person, club, year and relation match, but the source is The Manchester Courier, not The London Gazette. The named source is directly contradicted, so the answer is {non_factual_label}.",
-  "evidence_snippet_ids": ["S1", "S2"],
-  "final_answer": "{non_factual_label}"
-}}
-
-{{
-  "action": "answer",
   "reasoning": "TARGET_CLAIM requires: person XXX, club xxx Club, relation joined, date 1982. Snippet S1 states the same: XXX joined the xxx Club in 1982. The person, club, relation, and date all match exactly, so the answer is {factual_label}.",
   "evidence_snippet_ids": ["S1"],
   "final_answer": "{factual_label}"
 }}
 
+{{
+  "action": "answer",
+  "reasoning": "TARGET_CLAIM requires: person Arthur Bennett, club Riverside Cricket Club, relation joined, date 1985, source The London Gazette. Snippets S1 and S2 state: Arthur Bennett joined Riverside Cricket Club in 1985, and the record was published in The Manchester Courier. The person, club, year and relation match, but the source is The Manchester Courier, not The London Gazette. The named source is directly contradicted, so the answer is {non_factual_label}.",
+  "evidence_snippet_ids": ["S1", "S2"],
+  "final_answer": "{non_factual_label}"
+}}
 
+
+{{
+  "action": "answer",
+  "reasoning": "TARGET_CLAIM requires: painting The Blue Garden, relation exhibited at, source Royal Academy catalogue. Snippet S1 states: \"The Blue Garden was exhibited in London in 1904.\" The snippet has reached the right area of evidence and supports the painting and exhibition, but it does not state the Royal Academy catalogue as the source. The required source is missing, so the answer is {non_factual_label}.",
+  "evidence_snippet_ids": ["S1"],
+  "final_answer": "{non_factual_label}"
+}}
+
+{{
+  "action": "answer",
+  "reasoning": "TARGET_CLAIM requires: term adding machine, relation also called, alternate term calculating machine. Snippets S1 and S2 discuss an exercising machine patent, and Snippet S3 only defines calculating machine generally. None of the snippets mention adding machine or state that adding machine is also called calculating machine. The snippets have not reached the right area of evidence for TARGET_CLAIM, so the answer is {nei_label}.",
+  "evidence_snippet_ids": ["S1", "S2", "S3"],
+  "final_answer": "{nei_label}"
+}}
 
 """.strip()
 

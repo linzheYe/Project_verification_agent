@@ -35,10 +35,10 @@ INPUT_MODE = "model_jsonl"  # 输入文件格式: 仅支持 model_jsonl；rubric
 INPUT_PATH = Path("response_data/benchmark_10_5/simpleqa_model_answers_10_5.jsonl")  # 输入文件路径(相对项目根目录)
 # INPUT_PATH = Path("response_data/collected_30_5/claude-sonnet-4.6_30_5.jsonl")  # 输入文件路径(相对项目根目录)
 # INPUT_PATH = Path("response_data/chinese10_english10/bilingual_benchmark_data.jsonl") 
-START_LINE = 11 # 从输入文件第几行开始跑(1-based)
+START_LINE = 1 # 从输入文件第几行开始跑(1-based)
 NUM_LINES = 10 # 本次最多跑多少行
 OUTPUT_BASE_DIR = Path("clean_split_retrive_data/try")  # 输出根目录(每次run会在这里建一个子目录)
-RUN_NAME = "try44_small"  # 本次run目录名; 留空则自动用输入文件名(去后缀)
+RUN_NAME = "try51_small"  # 本次run目录名; 留空则自动用输入文件名(去后缀)
 
 # 如果要恢复上一次跑到一半的任务，保持同一个 RUN_NAME 直接再跑即可
 # 如果想强制全量重跑，把 RETRY_ONLY_ERRORS = False，或者换一个新的 RUN_NAME
@@ -62,8 +62,10 @@ RETRY_ONLY_ERRORS = True  # 若已有 clean/split 输出，则只重跑 error �
 EXISTING_TOPIC_GROUNDING_PATH = Path("prefetch_data/topics_10/output_with_urls_6/topic_grounding.jsonl")
 EXISTING_TOPIC_GUIDANCE_PATH = Path("prefetch_data/topics_10/output_with_urls_6/topic_guidance.jsonl")
 
-EXISTING_CLEAN_PATH = Path("clean_split_retrive_data/try/try43_small/cleaned_answer.jsonl")
-EXISTING_SPLIT_PATH = Path("clean_split_retrive_data/try/try43_small/split_claims.jsonl")
+#44是11～21
+#29是1~11
+EXISTING_CLEAN_PATH = Path("clean_split_retrive_data/try/try29_small/cleaned_answer.jsonl")
+EXISTING_SPLIT_PATH = Path("clean_split_retrive_data/try/try29_small/split_claims.jsonl")
 
 
 # CLEAN_MODEL = "google/gemini-3.1-flash-lite-preview"
@@ -77,12 +79,13 @@ MAX_PREPARE_WORKERS = 5 #workers
 MAX_RETRIEVAL_ROUND = 3
 MAX_RECOVERABLE_RETRIES_PER_ROUND = 2
 MAX_MUST_ANSWER_RETRIES = 2
-MAX_SNIPPET_PER_SEARCH = 10
+MAX_SNIPPET_PER_SEARCH = 6
 MAX_INITIAL_SNIPPETS = 5 # not count in fix snippets
 ENABLE_FIXED_TOPIC_GROUNDING_EVIDENCE = True
 ENABLE_FILTER_DATASET_SNIPPETS = True
 ENABLE_BM25_INITIAL_SELECT = True
-DUPLICATE_THRESHOLD = 0.9
+ENABLE_BM25_QUERY_STOPWORDS = True
+DUPLICATE_THRESHOLD = 0.8 #jaccard similarity
 NO_RESULT_DEFER_THRESHOLD = 1
 NO_PROGRESS_DEFER_THRESHOLD = 1
 TOP_K_FREQ_SNIPPETS = 5 # not count in fix snippets
@@ -231,6 +234,7 @@ def _load_config() -> SimpleQARunConfig:
         enable_fixed_topic_grounding_evidence=ENABLE_FIXED_TOPIC_GROUNDING_EVIDENCE,
         enable_filter_dataset_snippets=ENABLE_FILTER_DATASET_SNIPPETS,
         enable_bm25_initial_select=ENABLE_BM25_INITIAL_SELECT,
+        enable_bm25_query_stopwords=ENABLE_BM25_QUERY_STOPWORDS,
         duplicate_threshold=DUPLICATE_THRESHOLD,
         no_result_defer_threshold=NO_RESULT_DEFER_THRESHOLD,
         no_progress_defer_threshold=NO_PROGRESS_DEFER_THRESHOLD,
@@ -602,6 +606,7 @@ def main() -> None:
             enable_fixed_topic_grounding_evidence=cfg.enable_fixed_topic_grounding_evidence,
             enable_filter_dataset_snippets=cfg.enable_filter_dataset_snippets,
             enable_bm25_initial_select=cfg.enable_bm25_initial_select,
+            enable_bm25_query_stopwords=cfg.enable_bm25_query_stopwords,
             duplicate_threshold=cfg.duplicate_threshold,
             no_result_defer_threshold=cfg.no_result_defer_threshold,
             no_progress_defer_threshold=cfg.no_progress_defer_threshold,

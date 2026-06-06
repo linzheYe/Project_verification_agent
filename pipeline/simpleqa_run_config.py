@@ -56,6 +56,7 @@ class SimpleQARunConfig:
     enable_fixed_topic_grounding_evidence: bool
     enable_filter_dataset_snippets: bool
     enable_bm25_initial_select: bool
+    enable_bm25_query_stopwords: bool
     duplicate_threshold: float
     no_result_defer_threshold: int
     no_progress_defer_threshold: int

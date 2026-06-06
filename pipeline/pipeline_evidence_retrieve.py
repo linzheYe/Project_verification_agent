@@ -54,6 +54,7 @@ class EvidenceRetrievePipeline:
         max_snippet_per_search: int = 8,
         max_initial_snippets: int = 8,
         enable_bm25_initial_select: bool = True,
+        enable_bm25_query_stopwords: bool = False,
         duplicate_threshold: float = 0.9,
         max_recoverable_retries_per_round: int = 3,
         max_must_answer_retries: int = 2,
@@ -80,6 +81,7 @@ class EvidenceRetrievePipeline:
         self.max_snippet_per_search = max(1, int(max_snippet_per_search))
         self.max_initial_snippets = max(1, int(max_initial_snippets))
         self.enable_bm25_initial_select = bool(enable_bm25_initial_select)
+        self.enable_bm25_query_stopwords = bool(enable_bm25_query_stopwords)
         self.duplicate_threshold = float(duplicate_threshold)
         self.max_recoverable_retries_per_round = max(0, int(max_recoverable_retries_per_round))
         self.max_must_answer_retries = max(0, int(max_must_answer_retries))
@@ -290,6 +292,7 @@ class EvidenceRetrievePipeline:
                 claim_text,
                 pool,
                 top_k=max(0, int(self.max_initial_snippets)),
+                remove_query_stopwords=self.enable_bm25_query_stopwords,
             )]
 
         fixed_pool_snippets, regular_pool_snippets = self._split_fixed_topic_snippets(pool)
@@ -303,6 +306,7 @@ class EvidenceRetrievePipeline:
                 claim_text,
                 regular_pool_snippets,
                 top_k=max(0, int(self.max_initial_snippets)),
+                remove_query_stopwords=self.enable_bm25_query_stopwords,
             )
 
         return self._merge_present_snippets(
@@ -598,7 +602,7 @@ class EvidenceRetrievePipeline:
         return out
 
     def _build_high_freq_stats(self, statuses: list[ClaimSnippetStatus]) -> list[dict[str, Any]]:
-        by_question_counts: dict[str, dict[str, dict[str, int]]] = {}
+        by_question_counts: dict[str, dict[str, int]] = {}
         sample_ids_by_question: dict[str, list[str]] = {}
         for st in statuses:
             if st.claim_status != "done":
@@ -609,16 +613,12 @@ class EvidenceRetrievePipeline:
                 sample_ids_by_question.setdefault(qk, [])
                 if sid not in sample_ids_by_question[qk]:
                     sample_ids_by_question[qk].append(sid)
+            rationale_ids = self._extract_rationale_snippet_ids(st.final_reason)
+            if not rationale_ids:
+                continue
             mp = by_question_counts.setdefault(qk, {})
-            for sid in st.evidence_snippet_ids:
-                sid2 = str(sid).strip().upper()
-                if not sid2:
-                    continue
-                row = mp.setdefault(sid2, {"support_count": 0, "rationale_mention_count": 0})
-                row["support_count"] += 1
-            for sid in self._extract_rationale_snippet_ids(st.final_reason):
-                row = mp.setdefault(sid, {"support_count": 0, "rationale_mention_count": 0})
-                row["rationale_mention_count"] += 1
+            for sid in rationale_ids:
+                mp[sid] = int(mp.get(sid, 0)) + 1
 
         rows: list[dict[str, Any]] = []
         for qk, sid_counts in by_question_counts.items():
@@ -626,11 +626,9 @@ class EvidenceRetrievePipeline:
             pool_by_id = {str(x.get("snippet_id") or "").strip().upper(): x for x in pool}
             query = qk
             q_sample_ids = sample_ids_by_question.get(qk, [])
-            for sid, c in sid_counts.items():
+            for sid, support_count in sid_counts.items():
                 sn = pool_by_id.get(sid, {})
-                support_count = int(c.get("support_count") or 0)
-                rationale_mention_count = int(c.get("rationale_mention_count") or 0)
-                score = support_count * 2 + rationale_mention_count
+                score = int(support_count or 0)
                 rows.append(
                     {
                         "sample_id": q_sample_ids[0] if q_sample_ids else "",
@@ -639,8 +637,7 @@ class EvidenceRetrievePipeline:
                         "snippet_id": sid,
                         "url": str(sn.get("url") or ""),
                         "title": str(sn.get("title") or ""),
-                        "support_count": support_count,
-                        "rationale_mention_count": rationale_mention_count,
+                        "support_count": score,
                         "score": score,
                     }
                 )
@@ -868,6 +865,14 @@ class EvidenceRetrievePipeline:
                         direct_relevant_snippet_ids=[str(x.get("snippet_id") or "") for x in cached_direct],
                         round_source="query_cache_reuse",
                         round_outcome="reuse_direct",
+                        extra_trace_fields={
+                            "reused_from_query": str(cached.get("raw_query") or ""),
+                            "reused_from_cache_status": cache_status,
+                            "reused_similarity": round(float(cached.get("similarity") or 0.0), 4),
+                            "reused_from_direct_snippet_ids": [
+                                str(x.get("snippet_id") or "") for x in cached_direct
+                            ],
+                        },
                     )
                     self._inc_count("query_cache_reuse_ddg_skipped")
                     continue
@@ -880,6 +885,11 @@ class EvidenceRetrievePipeline:
                         direct_relevant_snippet_ids=[],
                         round_source="query_cache_reuse",
                         round_outcome="reuse_pending_propagated",
+                        extra_trace_fields={
+                            "reused_from_query": str(cached.get("raw_query") or ""),
+                            "reused_from_cache_status": cache_status,
+                            "reused_similarity": round(float(cached.get("similarity") or 0.0), 4),
+                        },
                     )
                     status.set_error("deferred_no_evidence: similar_query_cache_pending_or_empty")
                     defer_on_no_evidence = True
@@ -1221,6 +1231,7 @@ class EvidenceRetrievePipeline:
             qk = status.query
             latest_pool = self.question_pool_registry.get_question_pool_snippets(qk)
             pool_by_id = {str(x.get("snippet_id") or "").strip().upper(): x for x in latest_pool}
+            top_freq_ids_used: list[str] = []
             if not self.enable_fixed_topic_grounding_evidence:
                 # Legacy behavior: second pass prioritizes high-frequency snippets,
                 # then falls back to the latest full topic evidence pool.
@@ -1229,6 +1240,7 @@ class EvidenceRetrievePipeline:
                     for sid in top_freq_ids_by_question.get(qk, [])[: self.top_k_freq_snippets]
                     if sid in pool_by_id
                 ]
+                top_freq_ids_used = [str(sn.get("snippet_id") or "") for sn in top_freq]
                 if top_freq:
                     present = self._merge_present_snippets(
                         [self._snippet_brief(sn) for sn in top_freq],
@@ -1241,6 +1253,7 @@ class EvidenceRetrievePipeline:
                     for sid in top_freq_ids_by_question.get(qk, [])[: self.top_k_freq_snippets]
                     if sid in pool_by_id and not bool((pool_by_id[sid] or {}).get("is_fixed_topic_evidence"))
                 ]
+                top_freq_ids_used = [str(sn.get("snippet_id") or "") for sn in top_freq]
                 if top_freq or status.selected_present_snippets:
                     # Fixed topic grounding is always retained as background context.
                     # The top-k competition is only among non-fixed retrieval evidence.
@@ -1259,6 +1272,23 @@ class EvidenceRetrievePipeline:
                     )
                     status.update_present_snippets(present)
             self._finalize_deferred_error_claim(status)
+            status.record_search_round(
+                search_query="",
+                missing_fact_to_verify="",
+                selected_present_snippet_ids=[
+                    str(x.get("snippet_id") or "") for x in (status.selected_present_snippets or [])
+                ],
+                newly_added_pool_snippet_ids=[],
+                direct_relevant_snippet_ids=[str(x) for x in (status.evidence_snippet_ids or [])],
+                round_source="deferred_finalize",
+                round_outcome="must_answer_with_top_freq" if top_freq_ids_used else "must_answer_after_deferred",
+                extra_trace_fields={
+                    "top_freq_snippet_ids_used": list(top_freq_ids_used),
+                    "final_answer": str(status.final_answer or ""),
+                    "final_evidence_snippet_ids": [str(x) for x in (status.evidence_snippet_ids or [])],
+                    "resolved_from_error": str(status.error or ""),
+                },
+            )
             claim_status_row, trace_rows, evidence_row = self._build_rows_from_status(status)
             self._append_jsonl_row(self.claim_status_path, claim_status_row)
             for tr in trace_rows:

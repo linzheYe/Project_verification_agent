@@ -3,22 +3,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-# 类型别名（为了让注释和字段含义更直观）
-# - ModelSequenceId: 第几个模型回复（response_id），例如 1, 2, 3
-# - ClaimSequenceId: 该模型回复内第几条 claim（claim_in_response_id），例如 1, 2, 3
-# - TopicId: 主题组编号（int），例如 1, 2
-# - TopicName: 主题名，例如 "Apple 2023 financials"
-ModelSequenceId = int
-ClaimSequenceId = int
-TopicId = int
-TopicName = str
+ModelSequenceId = int  # model response index, e.g. 1, 2
+ClaimSequenceId = int  # claim index within one response, e.g. 1, 2
+TopicId = int  # topic group id, e.g. 1, 2
+TopicName = str  # topic label, e.g. "Apple 2023 financials"
 
 
 @dataclass(frozen=True)
 class ClaimRef:
-    """轻量 claim 引用。
+    """One atomic claim, keyed by (model_sequence_id, atomic_claim_sequence_number).
 
-    一个 claim 在 query 内由 `(model_sequence_id, atomic_claim_sequence_number)` 唯一定位。
+    Example::
+
+        ClaimRef(
+            model_sequence_id=1,
+            atomic_claim_sequence_number=2,
+            atomic_claim="Apple was founded in 1976.",
+        )
     """
 
     model_sequence_id: int
@@ -27,23 +28,29 @@ class ClaimRef:
 
 
 class SplitClaimRegistry:
-    """保存拆分阶段结果，并对外暴露 claim 查询接口。
+    """Stores split-stage claims per model for later grouping / verification lookup.
 
-    作用：
-    - 记住每个模型回复被拆成了哪些 claim。
-    - 提供稳定接口供后续 grouping / verification 阶段读取。
+    Internal shape after writes::
+
+        _claims_by_model = {
+            1: [ClaimRef(...), ClaimRef(...)],
+            2: [ClaimRef(...)],
+        }
     """
 
     def __init__(self) -> None:
-        """初始化空 registry。"""
+        """Create an empty registry (no models stored yet)."""
         self._claims_by_model: dict[int, list[ClaimRef]] = {}
 
     def add_model_claims(self, model_sequence_id: int, claims: Iterable[str]) -> list[dict]:
-        """写入一个模型的拆分结果，并返回 JSON 可写格式。
+        """Register split claims for one model; overwrite prior data for the same model id.
 
-        参数：
-        - model_sequence_id: 模型回复序号（response_id）。
-        - claims: 拆分得到的 claim 文本序列。
+        Returns JSON-ready dicts (empty list if every claim is blank)::
+
+            [
+                {"atomic_claim_sequence_number": 1, "atomic_claim": "Apple was founded in 1976."},
+                {"atomic_claim_sequence_number": 2, "atomic_claim": "Apple is headquartered in Cupertino."},
+            ]
         """
         refs: list[ClaimRef] = []
         for i, claim in enumerate(claims, start=1):
@@ -68,11 +75,24 @@ class SplitClaimRegistry:
         ]
 
     def get_claims_for_model(self, model_sequence_id: int) -> list[ClaimRef]:
-        """返回某个模型下的 claim 列表。"""
+        """Return all ClaimRef entries for one model (copy; mutating the list does not affect storage).
+
+        Example return for model 1::
+
+            [
+                ClaimRef(1, 1, "Apple was founded in 1976."),
+                ClaimRef(1, 2, "Apple is headquartered in Cupertino."),
+            ]
+
+        Returns ``[]`` if that model was never registered.
+        """
         return list(self._claims_by_model.get(model_sequence_id, []))
 
     def get_claim_text(self, model_sequence_id: int, claim_sequence_number: int) -> str | None:
-        """按双序号查询 claim 文本。"""
+        """Look up claim text by model id + claim sequence number.
+
+        Returns ``"Apple was founded in 1976."`` when found; ``None`` when missing.
+        """
         for ref in self._claims_by_model.get(model_sequence_id, []):
             if ref.atomic_claim_sequence_number == claim_sequence_number:
                 return ref.atomic_claim
@@ -80,41 +100,45 @@ class SplitClaimRegistry:
 
 
 class QueryTopicRegistry:
-    """每个 query 一个 topic registry，支持随模型推进增量更新。
+    """Per-query topic ledger: records topic names and which claim belongs to which topic.
 
-    - model_number
-    - processed_model_number
-    - topic_id_to_name: dict[topic_id(int), topic_name(str)]
-    - claim_topic_mapping: dict[model_sequence_id, list[(claim_sequence_id, topic_id)]]
-    说明：该类只负责记录，不负责 topic 生成/分组决策。
+    Does not run grouping or LLM calls — only stores results from upstream.
+
+    After updates, public fields look like::
+
+        topic_id_to_name = {1: "NVIDIA founding facts", 2: "GPU history"}
+        claim_topic_mapping = {
+            1: [(1, 1), (2, 2)],  # model 1: claim 1 -> topic 1, claim 2 -> topic 2
+            2: [(1, 2), (2, 2)],
+        }
     """
 
     def __init__(self, model_number: int) -> None:
-        """创建 query 级 registry。"""
+        """Create a query-level registry; ``model_number`` is the expected model count (>= 0)."""
         self.model_number: int = max(0, int(model_number))
         self.processed_model_number: int = 0
-        # topic_id_to_name:
-        # - key(int): topic_id，如 1, 2
-        # - value(str): topic_name，如 "NVIDIA founding facts"
-        # 示例: {1: "NVIDIA founding facts", 2: "GPU history"}
         self.topic_id_to_name: dict[TopicId, TopicName] = {}
-
-        # claim_topic_mapping:
-        # - key(int): model_sequence_id
-        # - value(list[tuple[int,int]]): [(claim_sequence_id, topic_id), ...]
-        # 也就是：每个模型回复里，每条 claim 属于哪个 topic（按 pair 记录）。
-        # 示例:
-        # {
-        #   1: [(1, 1), (2, 2)],   # 模型1: claim1->topic1, claim2->topic2
-        #   2: [(1, 2), (2, 2)]    # 模型2: claim1->topic2, claim2->topic2
-        # }
         self.claim_topic_mapping: dict[ModelSequenceId, list[tuple[ClaimSequenceId, TopicId]]] = {}
 
     def register_model_groups(self, model_sequence_id: int, groups: list[dict]) -> None:
-        """写入一个模型的分组结果，并维护 query 级状态。
+        """Merge one model's grouping output into topic / claim mappings.
+        Returns nothing. Example ``groups`` input::
 
-        约定：`groups` 已由外部模块完成格式校验与 topic_id 解析。
-        本类不做 topic 生成，也不做 LLM 输出纠错。
+            [
+                {
+                    "topic_group_id": 1,
+                    "topic_group_name": "NVIDIA founding facts",
+                    "atomic_claim_sequence_number": [1, 3],
+                },
+                {
+                    "topic_group_id": 2,
+                    "topic_group_name": "GPU history",
+                    "atomic_claim_sequence_number": [2],
+                },
+            ]
+
+        Updates ``topic_id_to_name`` and ``claim_topic_mapping[model_sequence_id]``; bumps
+        ``processed_model_number`` the first time a new ``model_sequence_id`` is seen.
         """
         if int(model_sequence_id) not in self.claim_topic_mapping:
             self.processed_model_number += 1
@@ -132,7 +156,6 @@ class QueryTopicRegistry:
             topic_name = str(group.get("topic_group_name") or "").strip()
             seq_nums = group.get("atomic_claim_sequence_number") or []
 
-            # 保持 topic_id -> topic_name 稳定：默认沿用第一次出现的名字。
             if topic_id not in self.topic_id_to_name:
                 self.topic_id_to_name[topic_id] = topic_name
             elif not self.topic_id_to_name[topic_id] and topic_name:
@@ -149,11 +172,17 @@ class QueryTopicRegistry:
         self.claim_topic_mapping[int(model_sequence_id)] = sorted(model_map.items(), key=lambda x: x[0])
 
     def get_topic_name(self, topic_id: int) -> str | None:
-        """按 topic_id 查询 topic_name。"""
+        """Return the topic name for a topic id.
+
+        Returns ``"NVIDIA founding facts"`` when registered; ``None`` if topic id is unknown.
+        """
         return self.topic_id_to_name.get(int(topic_id))
 
     def get_topic_for_claim(self, model_sequence_id: int, claim_sequence_number: int) -> int | None:
-        """查询某条 claim 归属的 topic_id。"""
+        """Return which topic id a claim belongs to.
+
+        Returns ``2`` when model 1 claim 2 maps to topic 2; ``None`` when unmapped.
+        """
         mapping = self.claim_topic_mapping.get(int(model_sequence_id), [])
         target = int(claim_sequence_number)
         for claim_seq, topic_id in mapping:
@@ -162,9 +191,23 @@ class QueryTopicRegistry:
         return None
 
     def get_model_claim_topic_pairs(self, model_sequence_id: int) -> list[tuple[int, int]]:
-        """返回某个模型的 claim-topic 对列表：[(claim_sequence_id, topic_id), ...]。"""
+        """Return all (claim_sequence_id, topic_id) pairs for one model (copy).
+
+        Example return for model 1::
+
+            [(1, 1), (2, 2)]
+
+        Returns ``[]`` if that model has no mapping.
+        """
         return list(self.claim_topic_mapping.get(int(model_sequence_id), []))
 
     def get_prior_topic_map(self) -> dict[str, str]:
-        """返回供 prompt 使用的 topic_id -> topic_name（key 格式为 'Tn'）。"""
+        """Build topic summary for prompts (keys prefixed with ``T``).
+
+        Example return::
+
+            {"T1": "NVIDIA founding facts", "T2": "GPU history"}
+
+        Returns ``{}`` when no topics are registered yet.
+        """
         return {f"T{topic_id}": topic_name for topic_id, topic_name in sorted(self.topic_id_to_name.items())}

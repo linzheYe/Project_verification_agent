@@ -6,12 +6,72 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-QuestionKey = str
+QuestionKey = str  # pool key; currently equals the query string
+
+EN_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "but",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "of",
+        "with",
+        "by",
+        "from",
+        "as",
+        "is",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+        "may",
+        "might",
+        "that",
+        "this",
+        "these",
+        "those",
+        "it",
+        "its",
+        "he",
+        "she",
+        "they",
+        "them",
+        "his",
+        "her",
+        "their",
+    }
+)
 
 
 @dataclass
 class QuestionPoolMeta:
-    """Metadata for one question-level evidence pool."""
+    """Metadata for one question-level evidence pool (query + which samples touched it).
+
+    Example::
+
+        QuestionPoolMeta(
+            query="When was NVIDIA founded?",
+            sample_ids=["sample_001", "sample_002"],
+        )
+    """
 
     query: str
     sample_ids: list[str] = field(default_factory=list)
@@ -19,11 +79,24 @@ class QuestionPoolMeta:
 
 @dataclass
 class ClaimSnippetStatus:
-    """State tracker for one claim across multi-round retrieval.
+    """Per-claim state for multi-round evidence retrieval and final verification.
 
-    Why a class:
-    - Retrieval loop needs stable per-claim state for debugging and replay.
-    - Keeping all fields together avoids scattered temporary variables.
+    Holds claim context, selected snippets, round logs, and the final answer.
+    Used by the retrieval pipeline to update one claim across DDG search rounds.
+
+    Example ``to_json_record()`` output (abbreviated)::
+
+        {
+            "sample_id": "sample_001",
+            "query": "When was NVIDIA founded?",
+            "model_sequence_id": 1,
+            "atomic_claim_sequence_number": 2,
+            "claim_text": "NVIDIA was founded in 1993.",
+            "claim_status": "done",
+            "final_answer": "supported",
+            "evidence_snippet_ids": ["S1", "S3"],
+            "round_logs": [{"round_index": 1, "search_query": "NVIDIA founding year", ...}],
+        }
     """
 
     sample_id: str
@@ -50,9 +123,22 @@ class ClaimSnippetStatus:
     error: str = ""
 
     def initialize_retrieval(self, selected_initial_snippets: list[dict[str, Any]]) -> None:
-        """Initialize per-claim retrieval state before first decision.
+        """Begin retrieval for this claim using BM25-picked snippets from the topic pool.
 
-        selected_initial_snippets are chosen from topic evidence pool by BM25.
+        Mutates:
+            ``claim_status`` → ``"retrieving"``
+            ``selected_initial_snippets`` → copy of input
+            ``selected_present_snippets`` → same as initial (starting context for round 1)
+
+        Example before: ``claim_status == "pending"``, both snippet lists empty.
+
+        Example after (input was one snippet)::
+
+            claim_status == "retrieving"
+            selected_initial_snippets == [
+                {"snippet_id": "S1", "url": "https://...", "title": "...", "content": "NVIDIA was founded in 1993."},
+            ]
+            selected_present_snippets == selected_initial_snippets  # same list content
         """
         self.claim_status = "retrieving"
         self.selected_initial_snippets = [dict(x) for x in selected_initial_snippets]
@@ -68,25 +154,63 @@ class ClaimSnippetStatus:
         direct_relevant_snippet_ids: list[str],
         round_source: str = "ddg_search",
         round_outcome: str = "",
+        extra_trace_fields: dict[str, Any] | None = None,
     ) -> None:
-        """Record one search iteration after DDG + filter steps complete."""
+        """Record one completed DDG search + filter round for traceability.
+
+        Mutates:
+            ``retrieval_round`` → incremented by 1
+            ``searched_queries`` → appends ``search_query``
+            ``round_logs`` → appends one dict for this round
+
+        Does not change ``selected_present_snippets`` (call ``update_present_snippets`` separately).
+
+        Example after first round::
+
+            retrieval_round == 1
+            searched_queries == ["NVIDIA founding year"]
+            round_logs[-1] == {
+                "round_index": 1,
+                "search_query": "NVIDIA founding year",
+                "missing_fact_to_verify": "exact founding date",
+                "selected_present_snippet_ids": ["S1", "S2"],
+                "newly_added_pool_snippet_ids": ["S5"],
+                "direct_relevant_snippet_ids": ["S5"],
+                "round_source": "ddg_search",
+                "round_outcome": "continue",
+            }
+        """
         self.retrieval_round += 1
         self.searched_queries.append(search_query)
-        self.round_logs.append(
-            {
-                "round_index": self.retrieval_round,
-                "search_query": search_query,
-                "missing_fact_to_verify": str(missing_fact_to_verify or "").strip(),
-                "selected_present_snippet_ids": list(selected_present_snippet_ids),
-                "newly_added_pool_snippet_ids": list(newly_added_pool_snippet_ids),
-                "direct_relevant_snippet_ids": list(direct_relevant_snippet_ids),
-                "round_source": str(round_source or "").strip(),
-                "round_outcome": str(round_outcome or "").strip(),
-            }
-        )
+        row = {
+            "round_index": self.retrieval_round,
+            "search_query": search_query,
+            "missing_fact_to_verify": str(missing_fact_to_verify or "").strip(),
+            "selected_present_snippet_ids": list(selected_present_snippet_ids),
+            "newly_added_pool_snippet_ids": list(newly_added_pool_snippet_ids),
+            "direct_relevant_snippet_ids": list(direct_relevant_snippet_ids),
+            "round_source": str(round_source or "").strip(),
+            "round_outcome": str(round_outcome or "").strip(),
+        }
+        if extra_trace_fields:
+            row.update(dict(extra_trace_fields))
+        self.round_logs.append(row)
 
     def update_present_snippets(self, present_snippets: list[dict[str, Any]]) -> None:
-        """Update the snippet set used for the next decision round."""
+        """Set which snippets the LLM sees on the next search-or-answer decision.
+
+        Mutates:
+            ``selected_present_snippets`` only (``selected_initial_snippets`` unchanged).
+
+        Example before: ``selected_present_snippets == [S1, S2]``
+
+        Example after (LLM filter kept S1 and new S5)::
+
+            selected_present_snippets == [
+                {"snippet_id": "S1", "content": "NVIDIA was founded in 1993.", ...},
+                {"snippet_id": "S5", "content": "Founded in April 1993.", ...},
+            ]
+        """
         self.selected_present_snippets = [dict(x) for x in present_snippets]
 
     def finalize_answer(
@@ -97,7 +221,22 @@ class ClaimSnippetStatus:
         evidence_snippet_ids: list[str],
         finished_by_max_round: bool,
     ) -> None:
-        """Close the claim with final answer and supporting snippet ids."""
+        """Close retrieval for this claim with a final verification label.
+
+        Mutates:
+            ``claim_status`` → ``"done"``
+            ``final_answer``, ``final_reason`` → verdict strings
+            ``evidence_snippet_ids`` → supporting pool ids (e.g. ``["S1", "S3"]``)
+            ``finished_by_max_round`` → True if stopped only because max rounds hit
+
+        Example after call::
+
+            claim_status == "done"
+            final_answer == "supported"
+            final_reason == "Snippet S1 states the founding year matches the claim."
+            evidence_snippet_ids == ["S1", "S3"]
+            finished_by_max_round == False
+        """
         self.claim_status = "done"
         self.final_answer = str(final_answer or "").strip()
         self.final_reason = str(final_reason or "").strip()
@@ -105,11 +244,23 @@ class ClaimSnippetStatus:
         self.finished_by_max_round = bool(finished_by_max_round)
 
     def set_error(self, error_text: str) -> None:
-        """Store explicit error message for traceability."""
+        """Attach a failure reason for this claim (does not change ``claim_status`` by itself).
+
+        Mutates:
+            ``error`` → stripped error string
+
+        Example after ``set_error("ddg_search_error: timeout")``::
+
+            error == "ddg_search_error: timeout"
+            claim_status  # unchanged, e.g. still "retrieving" unless caller sets it
+        """
         self.error = str(error_text or "").strip()
 
     def to_json_record(self) -> dict[str, Any]:
-        """Serialize status into one JSONL row."""
+        """Serialize full claim retrieval state for ``claim_status.jsonl``.
+
+        Returns one flat dict (all list fields are copies). See class docstring for shape.
+        """
         return {
             "sample_id": self.sample_id,
             "query": self.query,
@@ -134,15 +285,27 @@ class ClaimSnippetStatus:
 
 
 class QuestionEvidencePoolRegistry:
-    """Registry for all question-level evidence pools.
+    """In-memory registry of question-level evidence pools (shared by query string).
 
-    This class is intentionally narrow:
-    - It stores snippets per question.
-    - It provides BM25-based initial snippet selection for new claim processing.
-    - It does not decide search/query/action policies.
+    Stores web snippets per question, assigns stable ``S1``, ``S2`` ids, and picks
+    initial snippets for new claims (BM25). Does not run search or LLM policies.
+
+    Internal shape after use::
+
+        _pool_by_question["When was NVIDIA founded?"] = [
+            {"snippet_id": "S1", "url": "...", "title": "...", "content": "..."},
+        ]
     """
 
     def __init__(self) -> None:
+        """Initialize empty in-memory storage for all question evidence pools.
+
+        Sets state to::
+
+            _pool_by_question == {}
+            _meta_by_question == {}
+            _next_snippet_id_by_question == {}
+        """
         self._pool_by_question: dict[QuestionKey, list[dict[str, Any]]] = {}
         self._meta_by_question: dict[QuestionKey, QuestionPoolMeta] = {}
         self._next_snippet_id_by_question: dict[QuestionKey, int] = {}
@@ -154,11 +317,13 @@ class QuestionEvidencePoolRegistry:
         query: str,
         question_group_name: str,
     ) -> QuestionKey:
-        """Create pool entry on first use and return stable question key.
+        """Get or create the pool for ``query``; track ``sample_id`` in metadata.
 
-        Key policy:
-        - Pool is keyed only by query so snippets can be reused across sample_ids
-          under the same question/topic.
+        Pool is keyed only by ``query`` so snippets reuse across samples on the same question.
+
+        Returns the question key (same as ``query``). Example::
+
+            "When was NVIDIA founded?"
         """
         key: QuestionKey = str(query)
         if key not in self._pool_by_question:
@@ -176,7 +341,17 @@ class QuestionEvidencePoolRegistry:
         return key
 
     def get_question_pool_snippets(self, question_key: QuestionKey) -> list[dict[str, Any]]:
-        """Return current question evidence pool snippets."""
+        """Return all snippets in one question pool (shallow copy of each row).
+
+        Example return::
+
+            [
+                {"snippet_id": "S1", "url": "https://nvidia.com/...", "title": "About", "content": "..."},
+                {"snippet_id": "S2", "url": "https://...", "title": "...", "content": "..."},
+            ]
+
+        Returns ``[]`` if the pool does not exist or is empty.
+        """
         return [dict(x) for x in self._pool_by_question.get(question_key, [])]
 
     def add_snippets_to_question_pool(
@@ -184,12 +359,16 @@ class QuestionEvidencePoolRegistry:
         question_key: QuestionKey,
         snippets: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Append new snippets into pool and assign/preserve stable snippet_id.
+        """Append new snippets to the pool; assign ``S{n}`` ids when missing.
 
-        Note:
-        - Input snippets should already be deduplicated against current pool.
-        - If input snippet already provides snippet_id like S12, preserve it.
-        - Otherwise, snippet_id is assigned in insertion order for reproducible tracing.
+        Skips blank content and duplicate ``snippet_id`` already in the pool.
+        Caller should pre-dedupe by content via ``filter_non_duplicate_snippets_by_content``.
+
+        Returns only the rows actually added. Example return::
+
+            [
+                {"snippet_id": "S3", "url": "https://...", "title": "Wiki", "content": "Founded in 1993."},
+            ]
         """
         pool = self._pool_by_question.setdefault(question_key, [])
         self._next_snippet_id_by_question.setdefault(question_key, 1)
@@ -236,12 +415,20 @@ class QuestionEvidencePoolRegistry:
         claim_text: str,
         max_initial_snippets: int = 5,
         use_bm25: bool = True,
+        remove_query_stopwords: bool = False,
     ) -> list[dict[str, Any]]:
-        """Select initial snippets from old topic pool before processing a claim.
+        """Pick starting snippets from the topic pool before the first retrieval round.
 
-        Ranking policy:
-        - If use_bm25=True, return BM25 top-k snippets.
-        - If use_bm25=False, return all snippets in topic pool.
+        With ``use_bm25=True``, returns BM25 top-k; otherwise returns the full pool copy.
+
+        Example return (top 2)::
+
+            [
+                {"snippet_id": "S1", "content": "NVIDIA was founded in April 1993.", ...},
+                {"snippet_id": "S4", "content": "The company started as NVISION.", ...},
+            ]
+
+        Returns ``[]`` when the pool is empty.
         """
         pool = self._pool_by_question.get(question_key, [])
         if not pool:
@@ -252,25 +439,24 @@ class QuestionEvidencePoolRegistry:
             claim_text=claim_text,
             snippets=pool,
             top_k=max(0, int(max_initial_snippets)),
+            remove_query_stopwords=remove_query_stopwords,
         )
 
     def dump_question_pool_rows(self) -> list[dict[str, Any]]:
-        """Export all in-memory question evidence pools into JSONL row objects.
+        """Export every in-memory question pool for ``question_evidence_pool.jsonl``.
 
-        When this is called:
-        - Called once near the end of pipeline run, before writing
-          `question_evidence_pool.jsonl`.
+        Example return (one row per query)::
 
-        What it returns:
-        - One row per query key.
-        - Each row contains `pool_snippets` with stable `snippet_id`, `url`,
-          `title`, and `content`.
-
-        Why this is useful:
-        - The question pool is mutable in memory during retrieval loops.
-        - This export step snapshots the final state for reproducibility and debugging.
-        - Without this function, downstream analysis cannot see what evidence was
-          accumulated per question after the run.
+            [
+                {
+                    "sample_id": "sample_001",
+                    "sample_ids": ["sample_001", "sample_002"],
+                    "query": "When was NVIDIA founded?",
+                    "pool_snippets": [
+                        {"snippet_id": "S1", "url": "...", "title": "...", "content": "..."},
+                    ],
+                },
+            ]
         """
         rows: list[dict[str, Any]] = []
         for question_key, snippets in self._pool_by_question.items():
@@ -289,11 +475,9 @@ class QuestionEvidencePoolRegistry:
 
 
 def detect_text_language_simple(text: str) -> str:
-    """Simple Chinese/English detector for tokenizer choice.
+    """Detect zh vs en for BM25 tokenization (CJK present → ``zh``, else ``en``).
 
-    Rule of thumb:
-    - If CJK characters are present, use Chinese path.
-    - Otherwise use English path.
+    Returns ``"zh"`` or ``"en"``. Example: ``detect_text_language_simple("成立于1993")`` → ``"zh"``.
     """
     t = str(text or "")
     if re.search(r"[\u4e00-\u9fff]", t):
@@ -301,8 +485,20 @@ def detect_text_language_simple(text: str) -> str:
     return "en"
 
 
-def tokenize_for_bm25(text: str, lang: str) -> list[str]:
-    """Tokenize text for BM25 with lightweight zh/en handling."""
+def tokenize_for_bm25(
+    text: str,
+    lang: str,
+    *,
+    for_query: bool = False,
+    remove_stopwords: bool = False,
+) -> list[str]:
+    """Tokenize text for BM25 (English words; Chinese chars + bigrams + embedded English).
+
+    Returns a token list. Example::
+
+        tokenize_for_bm25("NVIDIA was founded in 1993", "en")
+        # -> ["nvidia", "was", "founded", "in", "1993"]
+    """
     s = str(text or "").lower()
     if not s:
         return []
@@ -313,7 +509,10 @@ def tokenize_for_bm25(text: str, lang: str) -> list[str]:
         en_words = re.findall(r"[a-z0-9]+", s)
         return zh_chars + zh_bigrams + en_words
 
-    return re.findall(r"[a-z0-9]+", s)
+    tokens = re.findall(r"[a-z0-9]+", s)
+    if for_query and remove_stopwords:
+        tokens = [t for t in tokens if t not in EN_STOPWORDS]
+    return tokens
 
 
 def rank_snippets_by_bm25(
@@ -323,12 +522,13 @@ def rank_snippets_by_bm25(
     *,
     k1: float = 1.5,
     b: float = 0.75,
+    remove_query_stopwords: bool = False,
 ) -> list[dict[str, Any]]:
-    """Rank snippets by BM25 and return top_k rows.
+    """Rank pool snippets by BM25 against ``claim_text``; return top-k snippet dicts (copies).
 
-    Why keep this in evidence_registry.py:
-    - This ranking is only used by claim initialization against topic pool.
-    - Putting it here keeps retrieval flow easy to follow in one place.
+    Example: with 10 pool snippets and ``top_k=3``, returns the 3 highest-scoring rows
+    (same keys as input, e.g. ``snippet_id``, ``content``). Returns ``[]`` if ``top_k <= 0``
+    or query tokenizes to empty.
     """
     if top_k <= 0:
         return []
@@ -340,7 +540,12 @@ def rank_snippets_by_bm25(
         docs.append(tokenize_for_bm25(content, lang))
 
     query_lang = detect_text_language_simple(claim_text)
-    query_terms = tokenize_for_bm25(claim_text, query_lang)
+    query_terms = tokenize_for_bm25(
+        claim_text,
+        query_lang,
+        for_query=True,
+        remove_stopwords=remove_query_stopwords,
+    )
     if not query_terms:
         return []
 
@@ -351,7 +556,6 @@ def rank_snippets_by_bm25(
     avgdl = sum(len(d) for d in docs) / n_docs if n_docs > 0 else 0.0
     avgdl = max(avgdl, 1.0)
 
-    # Document frequency table.
     df: dict[str, int] = {}
     for doc_tokens in docs:
         for term in set(doc_tokens):
@@ -369,7 +573,6 @@ def rank_snippets_by_bm25(
             term_df = df.get(term, 0)
             if term_df <= 0:
                 continue
-            # BM25 IDF (Robertson-Sparck Jones style).
             idf = math.log((n_docs - term_df + 0.5) / (term_df + 0.5) + 1.0)
             term_tf = tf.get(term, 0)
             if term_tf <= 0:
@@ -391,32 +594,42 @@ def filter_non_duplicate_snippets_by_content(
     topic_pool_snippets: list[dict[str, Any]],
     threshold: float = 0.9,
 ) -> list[dict[str, Any]]:
-    """Keep only snippets whose content is not near-duplicate to pool.
+    """Drop near-duplicate snippets by Jaccard similarity on ``content`` only.
 
-    Duplicate rule:
-    - Compare only `content` as requested.
-    - Jaccard similarity > threshold means duplicate and will be dropped.
+    Compares against the existing pool and snippets already accepted in this batch.
+
+    Example: pool has ``"Founded in 1993."``; new snippet with ~same content is dropped.
+    Returns kept rows (may be empty) with normalized ``url``, ``title``, ``content``::
+
+        [{"url": "https://...", "title": "Wiki", "content": "NVISION was the early name."}]
     """
-    existing_contents = [str((x or {}).get("content") or "").strip() for x in topic_pool_snippets]
+    # Precompute token sets once so the dedup pass stays linear-ish even when the
+    # topic pool becomes large.
+    existing_token_sets = [
+        _content_token_set_for_dedup(str((x or {}).get("content") or "").strip()) for x in topic_pool_snippets
+    ]
     kept: list[dict[str, Any]] = []
+    kept_token_sets: list[set[str]] = []
 
     for sn in new_snippets:
         content = str((sn or {}).get("content") or "").strip()
         if not content:
             continue
 
+        token_set = _content_token_set_for_dedup(content)
         is_dup = False
-        # Compare against existing pool first.
-        for old_content in existing_contents:
-            if _jaccard_similarity_by_content(content, old_content) > threshold:
+        # First compare against snippets that are already in the topic pool.
+        for old_token_set in existing_token_sets:
+            if _jaccard_similarity_by_token_set(token_set, old_token_set) > threshold:
                 is_dup = True
                 break
         if is_dup:
             continue
 
-        # Compare against snippets already kept in this same round.
-        for accepted in kept:
-            if _jaccard_similarity_by_content(content, str(accepted.get("content") or "")) > threshold:
+        # Then compare against snippets accepted earlier in the same batch so
+        # near-duplicates do not enter together.
+        for accepted_token_set in kept_token_sets:
+            if _jaccard_similarity_by_token_set(token_set, accepted_token_set) > threshold:
                 is_dup = True
                 break
         if is_dup:
@@ -427,15 +640,38 @@ def filter_non_duplicate_snippets_by_content(
         kept_row["title"] = str((sn or {}).get("title") or "").strip()
         kept_row["content"] = content
         kept.append(kept_row)
+        kept_token_sets.append(token_set)
 
     return kept
 
 
 def _jaccard_similarity_by_content(a: str, b: str) -> float:
-    """Compute content-level Jaccard similarity for deduplication."""
-    lang = "zh" if detect_text_language_simple(a + b) == "zh" else "en"
-    set_a = set(tokenize_for_bm25(a, lang))
-    set_b = set(tokenize_for_bm25(b, lang))
+    """Jaccard similarity of token sets from two content strings (0.0–1.0)."""
+    set_a = _content_token_set_for_dedup(a)
+    set_b = _content_token_set_for_dedup(b)
+    return _jaccard_similarity_by_token_set(set_a, set_b)
+
+
+def _content_token_set_for_dedup(text: str) -> set[str]:
+    """Token set for content dedup; English removes stopwords before Jaccard.
+
+    This is intentionally separate from BM25 scoring. We still use a token-set
+    Jaccard comparison here; the only change is the token view used to build the
+    set.
+    """
+    s = str(text or "").strip()
+    if not s:
+        return set()
+
+    lang = "zh" if detect_text_language_simple(s) == "zh" else "en"
+    tokens = tokenize_for_bm25(s, lang)
+    if lang == "en":
+        tokens = [t for t in tokens if t not in EN_STOPWORDS]
+    return set(tokens)
+
+
+def _jaccard_similarity_by_token_set(set_a: set[str], set_b: set[str]) -> float:
+    """Jaccard similarity of two token sets (0.0–1.0)."""
     if not set_a and not set_b:
         return 1.0
     if not set_a or not set_b:
