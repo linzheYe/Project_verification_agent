@@ -401,7 +401,7 @@ NEXT_SEARCH_OR_ANSWER_SYSTEM_PROMPT_TEMPLATE = """
 You are provided with:
 - TARGET_CLAIM: the claim that needs to be checked.
 - response_context: the original response containing TARGET_CLAIM. Use it ONLY to understand what TARGET_CLAIM refers to.
-- search_history: retrieval history by round. Each item contains the round_index, the search_query used in that round, the newly added direct-evidence snippet ids for this claim from that round, and the corresponding snippet contents.
+- search_history: retrieval history by round. Each item contains the round_index, the search query used in that round, the newly retrived direct-evidence snippet ids and content using this search query.
 - topic_guidance_for_search: guidance for understanding the topic.
 
 
@@ -446,8 +446,10 @@ Element check: the date April 1824 is supported, but the named source is contrad
 Decision: `{non_factual_label}`.
 
 
+
 ## Step 2 — Generate a Search Query If Needed
-If Step 1 does not provide enough direct evidence to verify ALL factual elements in the TARGET_CLAIM, identify the missing factual element and create one keyword-style Google search query for it. Use the fewest words needed for retrieval.
+If Step 1 does not provide enough direct evidence to verify ALL factual elements in the TARGET_CLAIM, identify the missing factual element and create one keyword-style Google search query for it. Use the fewest words when generating the search query.
+Review each prior search query and its returned snippets. If they still leave the missing fact unresolved, treat the query direction as wrong and issue a new query targeting a different angle.
 
 **Query rules:**
 - Use core keywords only: names, nouns, domain terms, and target values. Remove extra context and low-value verbs such as “means”, “signifies”, “represents”, “occurred”, or “refers to”.
