@@ -38,7 +38,7 @@ INPUT_PATH = Path("response_data/benchmark_10_5/simpleqa_model_answers_10_5.json
 START_LINE = 1 # 从输入文件第几行开始跑(1-based)
 NUM_LINES = 10 # 本次最多跑多少行
 OUTPUT_BASE_DIR = Path("clean_split_retrive_data/try")  # 输出根目录(每次run会在这里建一个子目录)
-RUN_NAME = "try51_small"  # 本次run目录名; 留空则自动用输入文件名(去后缀)
+RUN_NAME = "try52_small"  # 本次run目录名; 留空则自动用输入文件名(去后缀)
 
 # 如果要恢复上一次跑到一半的任务，保持同一个 RUN_NAME 直接再跑即可
 # 如果想强制全量重跑，把 RETRY_ONLY_ERRORS = False，或者换一个新的 RUN_NAME
@@ -80,12 +80,12 @@ MAX_RETRIEVAL_ROUND = 3
 MAX_RECOVERABLE_RETRIES_PER_ROUND = 2
 MAX_MUST_ANSWER_RETRIES = 2
 MAX_SNIPPET_PER_SEARCH = 6
-MAX_INITIAL_SNIPPETS = 5 # not count in fix snippets
+MAX_INITIAL_SNIPPETS = 6 # not count in fix snippets
 ENABLE_FIXED_TOPIC_GROUNDING_EVIDENCE = True
 ENABLE_FILTER_DATASET_SNIPPETS = True
 ENABLE_BM25_INITIAL_SELECT = True
 ENABLE_BM25_QUERY_STOPWORDS = True
-DUPLICATE_THRESHOLD = 0.8 #jaccard similarity
+DUPLICATE_THRESHOLD = 0.9 #jaccard similarity
 NO_RESULT_DEFER_THRESHOLD = 1
 NO_PROGRESS_DEFER_THRESHOLD = 1
 TOP_K_FREQ_SNIPPETS = 5 # not count in fix snippets

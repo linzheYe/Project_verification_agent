@@ -8,6 +8,7 @@ import requests
 
 from scripts.data_io import parse_json_object_robust
 from scripts.ddg_search import search_snippets_with_ddg
+from scripts.evidence_registry import _content_token_set_for_dedup, _jaccard_similarity_by_token_set
 from scripts.llm_api import LLMClient, LLMConnectivityError
 from scripts.prompt_template import (
     build_topic_grounding_evidence_extract_prompt,
@@ -81,19 +82,11 @@ def normalize_url(url: str) -> str:
     normalized = re.sub(r"#.*$", "", normalized)
     return normalized.rstrip("/")
 
-
-def _simple_tokenize(text: str) -> set[str]:
-    return set(re.findall(r"[\w\u4e00-\u9fff]+", str(text or "").lower()))
-
-
 def _jaccard_similarity(text_a: str, text_b: str) -> float:
-    tokens_a = _simple_tokenize(text_a)
-    tokens_b = _simple_tokenize(text_b)
-    if not tokens_a and not tokens_b:
-        return 1.0
-    if not tokens_a or not tokens_b:
-        return 0.0
-    return len(tokens_a & tokens_b) / max(1, len(tokens_a | tokens_b))
+    return _jaccard_similarity_by_token_set(
+        _content_token_set_for_dedup(text_a),
+        _content_token_set_for_dedup(text_b),
+    )
 
 
 def _call_llm_json(llm: LLMClient, system_prompt: str, user_prompt: str, *, stage_name: str) -> dict[str, Any]:
@@ -191,23 +184,55 @@ def _retrieve_ddg_snippet_candidates(
 # Shared candidate preparation logic
 # ==================================
 def dedup_search_candidates_by_url(candidates: list[SearchSnippetCandidate]) -> list[SearchSnippetCandidate]:
-    """Dedup by normalized URL only, preserving first-seen rows."""
-    seen_urls: set[str] = set()
-    deduplicated: list[SearchSnippetCandidate] = []
+    """Merge candidates that share the same normalized URL."""
+    merged_by_url: dict[str, dict[str, Any]] = {}
+    url_order: list[str] = []
     for candidate in candidates:
         if not candidate.url:
             continue
-        if candidate.url in seen_urls:
+        merged = merged_by_url.get(candidate.url)
+        if merged is None:
+            merged_by_url[candidate.url] = {
+                "topic_id": candidate.topic_id,
+                "url": candidate.url,
+                "title": candidate.title,
+                "snippets": [candidate.snippet] if candidate.snippet else [],
+            }
+            url_order.append(candidate.url)
             continue
-        seen_urls.add(candidate.url)
-        deduplicated.append(candidate)
+        if not merged.get("title") and candidate.title:
+            merged["title"] = candidate.title
+        if candidate.snippet and candidate.snippet not in merged["snippets"]:
+            merged["snippets"].append(candidate.snippet)
+
+    deduplicated: list[SearchSnippetCandidate] = []
+    for index, url in enumerate(url_order, start=1):
+        merged = merged_by_url[url]
+        combined_snippet = "\n\n".join(
+            snippet for snippet in merged.get("snippets", []) if _normalize_whitespace(snippet)
+        ).strip()
+        if not combined_snippet:
+            continue
+        topic_id = str(merged.get("topic_id") or "T0")
+        deduplicated.append(
+            SearchSnippetCandidate(
+                candidate_id=f"{topic_id}_TC{index}",
+                topic_id=topic_id,
+                query_id="",
+                query_text="",
+                url=url,
+                title=str(merged.get("title") or ""),
+                snippet=combined_snippet,
+                rank=index,
+            )
+        )
     return deduplicated
 
 
 def dedup_search_candidates_by_snippet_similarity(
     candidates: list[SearchSnippetCandidate], near_dup_threshold: float
 ) -> list[SearchSnippetCandidate]:
-    """Dedup by title+snippet semantic overlap using Jaccard similarity."""
+    """Dedup by snippet content overlap using stopword-aware Jaccard similarity."""
     deduplicated: list[SearchSnippetCandidate] = []
     for candidate in candidates:
         if not candidate.url or not candidate.snippet:
@@ -215,9 +240,7 @@ def dedup_search_candidates_by_snippet_similarity(
 
         is_duplicate = False
         for kept in deduplicated:
-            kept_text = f"{kept.title} {kept.snippet}".strip()
-            candidate_text = f"{candidate.title} {candidate.snippet}".strip()
-            if _jaccard_similarity(kept_text, candidate_text) >= near_dup_threshold:
+            if _jaccard_similarity(kept.snippet, candidate.snippet) >= near_dup_threshold:
                 is_duplicate = True
                 break
 
