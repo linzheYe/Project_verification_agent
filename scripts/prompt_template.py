@@ -655,6 +655,198 @@ fetched_pages_with_url_id:
 """.strip()
 
 
+TOPIC_GROUNDING_EVIDENCE_EXTRACT_WITH_ANSWER_SYSTEM_PROMPT_TEMPLATE = """
+Extract evidence from fetched full-page texts for topic-level grounding, and produce topic brief in the same output.
+
+Context:
+- The program already performed snippet dedup and LLM candidate selection.
+- The fetched pages are from URLs mapped by selected candidate_id.
+- In this variant, a proposed answer to topic_query is also provided.
+
+Output requirements:
+- Return both `evidence_items` and `topic_brief`.
+- Also return `answer_assessment`.
+- Each item must include:
+  - url_id
+  - relevant_text (a relatively long direct text segment from source page)
+  - summary(a complete summary of the relevant_text)
+- Do not fabricate facts.
+- Keep relevant_text tied to source text (do not output summary-only evidence).
+- One URL may yield multiple evidence items.
+- `topic_brief` is retrieval guidance, not just direct evidence;
+- `topic_brief` should be vivid and concrete in writing.
+- Each factual statement in topic_brief must cite evidence snippet IDs like [S1].
+- Use only topic_query and extracted evidence_items.
+- Do not introduce new entities/dates/works not present in topic_query or evidence_items.
+
+Answer assessment requirements:
+- `answer_assessment` evaluates whether the provided_answer is supported as an answer to topic_query.
+- Base the judgment on fetched evidence and extracted evidence_items. Use topic_brief only as a concise synthesis of the same evidence, not as an independent source.
+- `answer_assessment.reasoning` must cite evidence snippet IDs like [S1] or [S1][S2], in the same style as topic_brief.
+- `answer_assessment.reasoning` must reason step by step. Keep the wording simple and direct.
+- In the JSON object for `answer_assessment`, output `reasoning` before the boolean judgment fields.
+- Do not output a separate `supporting_snippet_ids` field.
+- Use this decision process:
+  1. State what field the question is asking for.
+  2. State what each useful snippet says for that field.
+  3. Decide whether the snippets agree, conflict, or do not directly answer that field.
+  4. Then decide `is_supported`, `is_unique_answer`, and `canonical_answer`.
+- Set `is_supported` to true only when the evidence set supports the provided_answer and no snippet gives a different value for the same field.
+- Set `is_unique_answer` to true only when the evidence set gives one answer for the asked field and no snippet gives a different value for that same field.
+- If one direct table, infobox, or award/filmography row gives the answer and the other snippets do not conflict with it, then `is_unique_answer` should usually be true.
+- If some snippet is broader, uses a different label, or talks about a related field, do not treat it as direct conflict unless it gives a different value for the same field asked by the question.
+- If the evidence does not clearly resolve one corrected answer, leave `canonical_answer` as an empty string.
+
+Few-shot example 1:
+Query: On what date was the soundtrack released?
+Provided answer: August 10, 1995
+Snippet S1: The soundtrack was released on August 10, 1995. [S1]
+Snippet S2: The soundtrack was released on July 11, 1995. [S2]
+Reasoning:
+Step 1: The question asks for the soundtrack release date.
+Step 2: S1 gives August 10, 1995 for that date [S1].
+Step 3: S2 gives July 11, 1995 for that same date [S2].
+Step 4: These two snippets give different values for the same field [S1][S2].
+Step 5: The evidence conflicts, so the provided answer is not supported and the answer is not unique [S1][S2].
+Output:
+{{
+  "answer_assessment": {{
+    "provided_answer": "August 10, 1995",
+    "reasoning": "Step 1: The question asks for the soundtrack release date. Step 2: S1 gives August 10, 1995 for that date [S1]. Step 3: S2 gives July 11, 1995 for that same date [S2]. Step 4: These two snippets give different values for the same field [S1][S2]. Step 5: The evidence conflicts, so the provided answer is not supported and the answer is not unique [S1][S2].",
+    "is_supported": false,
+    "is_unique_answer": false,
+    "canonical_answer": ""
+  }}
+}}
+
+Few-shot example 2:
+Query: How many films did the actor appear in during 2022?
+Provided answer: 3
+Snippet S1: A filmography table lists three 2022 film rows. [S1]
+Snippet S2: One of those films is confirmed as a 2022 title. [S2]
+Snippet S3: Another of those films is confirmed as a 2022 title. [S3]
+Reasoning:
+Step 1: The question asks for the number of 2022 films.
+Step 2: S1 directly gives three film rows for 2022 [S1].
+Step 3: S2 and S3 support that those rows are real 2022 films [S2][S3].
+Step 4: No snippet gives a different count for 2022 [S1][S2][S3].
+Step 5: The evidence supports 3, and the answer is unique in this evidence set [S1][S2][S3].
+Output:
+{{
+  "answer_assessment": {{
+    "provided_answer": "3",
+    "reasoning": "Step 1: The question asks for the number of 2022 films. Step 2: S1 directly gives three film rows for 2022 [S1]. Step 3: S2 and S3 support that those rows are real 2022 films [S2][S3]. Step 4: No snippet gives a different count for 2022 [S1][S2][S3]. Step 5: The evidence supports 3, and the answer is unique in this evidence set [S1][S2][S3].",
+    "is_supported": true,
+    "is_unique_answer": true,
+    "canonical_answer": "3"
+  }}
+}}
+
+Few-shot example 3:
+Query: On what date did the person begin the office of Head of State?
+Provided answer: January 1, 1925
+Snippet S1: A table labeled "Head of State" gives term start as January 1, 1925. [S1]
+Snippet S2: A broader list of heads of state gives a longer tenure starting June 28, 1922. [S2]
+Snippet S3: A president table gives a term start of June 29, 1922. [S3]
+Reasoning:
+Step 1: The question asks for the start date of the office "Head of State".
+Step 2: S1 directly gives that field: January 1, 1925 [S1].
+Step 3: S2 and S3 use broader or different office labels [S2][S3].
+Step 4: Because S2 and S3 do not give the same field in the same way, they are not direct conflict with S1 for this question [S1][S2][S3].
+Step 5: The evidence supports January 1, 1925, and that answer is unique in this evidence set [S1].
+Output:
+{{
+  "answer_assessment": {{
+    "provided_answer": "January 1, 1925",
+    "reasoning": "Step 1: The question asks for the start date of the office 'Head of State'. Step 2: S1 directly gives that field: January 1, 1925 [S1]. Step 3: S2 and S3 use broader or different office labels [S2][S3]. Step 4: Because S2 and S3 do not give the same field in the same way, they are not direct conflict with S1 for this question [S1][S2][S3]. Step 5: The evidence supports January 1, 1925, and that answer is unique in this evidence set [S1].",
+    "is_supported": true,
+    "is_unique_answer": true,
+    "canonical_answer": "January 1, 1925"
+  }}
+}}
+
+Few-shot example 4:
+Query: For how many years was the region administered as a fief during 1703–1784?
+Provided answer: 78
+Snippet S1: A table shows fief from 1703 to 1745, then not-fief from 1745 to 1748, then fief again from 1748 to 1784. [S1]
+Snippet S2: A second source repeats the same two fief intervals: 1703–1745 and 1748–1784. [S2]
+Reasoning:
+Step 1: The question asks for the total number of years in the fief periods within 1703–1784.
+Step 2: S1 gives two fief intervals: 1703–1745 and 1748–1784, with a non-fief gap in between [S1].
+Step 3: S2 gives the same two fief intervals [S2].
+Step 4: Using the same year-boundary convention shown by the table, the durations are (1745 - 1703) and (1784 - 1748), which sum to 78 [S1][S2].
+Step 5: No snippet gives different interval boundaries or a different total for this same field [S1][S2].
+Step 6: The evidence supports 78, and the answer is unique in this evidence set [S1][S2].
+Output:
+{{
+  "answer_assessment": {{
+    "provided_answer": "78",
+    "reasoning": "Step 1: The question asks for the total number of years in the fief periods within 1703–1784. Step 2: S1 gives two fief intervals: 1703–1745 and 1748–1784, with a non-fief gap in between [S1]. Step 3: S2 gives the same two fief intervals [S2]. Step 4: Using the same year-boundary convention shown by the table, the durations are (1745 - 1703) and (1784 - 1748), which sum to 78 [S1][S2]. Step 5: No snippet gives different interval boundaries or a different total for this same field [S1][S2]. Step 6: The evidence supports 78, and the answer is unique in this evidence set [S1][S2].",
+    "is_supported": true,
+    "is_unique_answer": true,
+    "canonical_answer": "78"
+  }}
+}}
+
+Few-shot example 5:
+Query: What is the rank number of Company X among the largest private employers in the state as of March 2019?
+Provided answer: 5
+Snippet S1: A source says Company X is in the top five employers. [S1]
+Snippet S2: Another source gives a March 2014 top-five list and includes Company X, but does not say its exact March 2019 rank. [S2]
+Reasoning:
+Step 1: The question asks for one exact field: the rank number of Company X as of March 2019.
+Step 2: S1 only says Company X is in the top five, not that it is ranked 5th [S1].
+Step 3: S2 also fails to give the exact March 2019 rank number, and it is about a different year [S2].
+Step 4: The evidence does not give the exact requested value for the asked field [S1][S2].
+Step 5: Because the exact rank number is missing, the provided answer is not supported, and the answer is not unique [S1][S2].
+Output:
+{{
+  "answer_assessment": {{
+    "provided_answer": "5",
+    "reasoning": "Step 1: The question asks for one exact field: the rank number of Company X as of March 2019. Step 2: S1 only says Company X is in the top five, not that it is ranked 5th [S1]. Step 3: S2 also fails to give the exact March 2019 rank number, and it is about a different year [S2]. Step 4: The evidence does not give the exact requested value for the asked field [S1][S2]. Step 5: Because the exact rank number is missing, the provided answer is not supported, and the answer is not unique [S1][S2].",
+    "is_supported": false,
+    "is_unique_answer": false,
+    "canonical_answer": ""
+  }}
+}}
+
+Return only valid JSON:
+{{
+  "evidence_items": [
+    {{
+      "snippet_id": "S1",
+      "url_id": "397_EXT_U1",
+      "relevant_text": "...",
+      "summary": "..."
+    }}
+  ],
+  "topic_brief": "...",
+  "answer_assessment": {{
+    "provided_answer": "...",
+    "reasoning": "Step 1: ... [S1] Step 2: ... [S2] Step 3: ... Therefore ... [S1][S2]",
+    "is_supported": true,
+    "is_unique_answer": false,
+    "canonical_answer": "..."
+  }}
+}}
+""".strip()
+
+
+TOPIC_GROUNDING_EVIDENCE_EXTRACT_WITH_ANSWER_USER_PROMPT_TEMPLATE = """
+topic_id:
+{topic_id}
+
+topic_query:
+{query}
+
+provided_answer:
+{answer}
+
+fetched_pages_with_url_id:
+{pages}
+""".strip()
+
+
 # topic_brief is now generated together with evidence extraction in one prompt.
 
 
@@ -891,6 +1083,21 @@ def build_topic_grounding_evidence_extract_prompt(payload: Mapping[str, Any]) ->
     user_prompt = TOPIC_GROUNDING_EVIDENCE_EXTRACT_USER_PROMPT_TEMPLATE.format(
         topic_id=topic_id,
         query=query,
+        pages=json.dumps(list(pages), ensure_ascii=False, indent=2),
+    )
+    return system_prompt, user_prompt
+
+
+def build_topic_grounding_evidence_extract_with_answer_prompt(payload: Mapping[str, Any]) -> tuple[str, str]:
+    topic_id = str(payload.get("topic_id") or "").strip()
+    query = str(payload.get("query") or "").strip()
+    answer = str(payload.get("answer") or "").strip()
+    pages = payload.get("pages") or []
+    system_prompt = TOPIC_GROUNDING_EVIDENCE_EXTRACT_WITH_ANSWER_SYSTEM_PROMPT_TEMPLATE
+    user_prompt = TOPIC_GROUNDING_EVIDENCE_EXTRACT_WITH_ANSWER_USER_PROMPT_TEMPLATE.format(
+        topic_id=topic_id,
+        query=query,
+        answer=answer,
         pages=json.dumps(list(pages), ensure_ascii=False, indent=2),
     )
     return system_prompt, user_prompt

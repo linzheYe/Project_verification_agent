@@ -1,0 +1,9 @@
+{
+  "topic_count": 10,
+  "failed_topic_count": 0,
+  "external_urls_enabled": true,
+  "topic_grounding_path": "/home/an/Project_verification_agent/prefetch_data/yue_question/try7_4to13/topic_grounding_with_answer.jsonl",
+  "topic_guidance_path": "/home/an/Project_verification_agent/prefetch_data/yue_question/try7_4to13/topic_guidance_with_answer.jsonl",
+  "fetched_fulltext_path": "/home/an/Project_verification_agent/prefetch_data/yue_question/try7_4to13/fetched_fulltext_pages.jsonl",
+  "topic_grounding_trace_path": "/home/an/Project_verification_agent/prefetch_data/yue_question/try7_4to13/topic_grounding_trace_with_answer.jsonl"
+}

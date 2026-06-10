@@ -1,3 +1,6 @@
 temp/
 clean_split_retrive_data/
 mds/
+__pycache__/
+*.py[cod]
+.pytest_cache/
