@@ -1,6 +1,7 @@
 from scripts.prefetch_topic_evidence_stages import (
     PrefetchStageConfig,
     SearchSnippetCandidate,
+    SNIPPET_SEGMENT_SEPARATOR,
     dedup_search_candidates_by_snippet_similarity,
     dedup_search_candidates_by_url,
     prepare_search_candidates_for_selection,
@@ -47,7 +48,7 @@ def test_dedup_search_candidates_by_url_merges_snippets_and_reassigns_ids() -> N
     assert len(merged) == 1
     assert merged[0].candidate_id == "T1_TC1"
     assert merged[0].title == "Example Page"
-    assert merged[0].snippet == "First summary.\n\nSecond summary."
+    assert merged[0].snippet == f"First summary.{SNIPPET_SEGMENT_SEPARATOR}Second summary."
 
 
 def test_dedup_search_candidates_by_snippet_similarity_uses_content_only() -> None:

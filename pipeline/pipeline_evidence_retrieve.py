@@ -273,9 +273,7 @@ class EvidenceRetrievePipeline:
                 continue
             present_by_id[sid] = {
                 "snippet_id": sid,
-                "url": str((sn or {}).get("url") or "").strip(),
-                "title": str((sn or {}).get("title") or "").strip(),
-                "content": str((sn or {}).get("content") or "").strip(),
+                "text": str((sn or {}).get("content") or "").strip(),
             }
 
         history: list[dict[str, Any]] = []
@@ -283,7 +281,6 @@ class EvidenceRetrievePipeline:
             search_query = str((row or {}).get("search_query") or "").strip()
             if not search_query:
                 continue
-            valid_ids: list[str] = []
             valid_snippets: list[dict[str, Any]] = []
             for raw_sid in ((row or {}).get("direct_relevant_snippet_ids") or []):
                 sid = str(raw_sid or "").strip()
@@ -292,14 +289,12 @@ class EvidenceRetrievePipeline:
                 snippet = present_by_id.get(sid)
                 if snippet is None:
                     continue
-                valid_ids.append(sid)
                 valid_snippets.append(dict(snippet))
             history.append(
                 {
                     "round_index": int((row or {}).get("round_index") or 0),
                     "search_query": search_query,
-                    "newly_added_present_snippet_ids": valid_ids,
-                    "newly_added_present_snippets": valid_snippets,
+                    "new_evidence": valid_snippets,
                 }
             )
         return history
@@ -556,6 +551,7 @@ class EvidenceRetrievePipeline:
                     status.query,
                     self._topic_guidance_by_query.get(status.query, ""),
                 ),
+                "searched_queries": list(status.searched_queries),
                 "present_snippets_with_ids": [
                     self._snippet_brief_without_round(x) for x in present_snippets
                 ],

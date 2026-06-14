@@ -20,8 +20,8 @@ from scripts.prefetch_topic_evidence_stages import PrefetchStageConfig
 # =========================
 # All paths below are relative to project root: /home/an/Project_verification_agent
 
-INPUT_JSONL = "prefetch_data/topics_10/simpleqa_10_urls.jsonl"
-OUTPUT_DIR = "prefetch_data/topics_10/without_urls_3_test"
+INPUT_JSONL = "prefetch_data/topics_select/simpleqa_select_4topics.jsonl"
+OUTPUT_DIR = "prefetch_data/topics_select/try2_2"
 LLM_MODEL = "openai/gpt-5.4-nano"
 USE_INPUT_URLS = False
 ENABLE_TOPIC_PARALLEL = True
@@ -37,9 +37,9 @@ QUERY_FIELD_FALLBACKS = ["simpleqa_problem"] # fallback field names if primary f
 TOPIC_ID_FIELD = "original_index"
 URL_FIELD = "urls"
 REQUIRE_TOPIC_ID_FROM_INPUT = True
-# For a quick smoke test, set LIMIT_TOPICS to a small integer like 3.
-# To run the full input JSONL without slicing, set LIMIT_TOPICS = None.
-LIMIT_TOPICS: int | None = 3
+TOPIC_START_INDEX = 3  # 0-based inclusive start index; the row at this index is included in the run.
+LIMIT_TOPICS: int | None = 2
+# Example: to run rows 4-6 only, use TOPIC_START_INDEX = 3 and LIMIT_TOPICS = 3.
 
 # Retrieval scale configuration:
 # - WIKI_QUERY_COUNT / WEB_QUERY_COUNT: number of generated search queries.
@@ -166,9 +166,17 @@ def main() -> None:
     _prepare_output_dir_and_check_conflicts(output_dir, OUTPUT_CONFLICT_POLICY)
 
     topic_rows = _read_topic_rows(input_jsonl, use_input_urls=bool(USE_INPUT_URLS))
+    start_index = max(0, int(TOPIC_START_INDEX))
+    topic_rows = topic_rows[start_index:]
     if LIMIT_TOPICS is not None:
         topic_rows = topic_rows[: max(0, int(LIMIT_TOPICS))]
-    _progress(f"INPUT_LOADED topic_count={len(topic_rows)} use_input_urls={USE_INPUT_URLS}")
+    _progress(
+        "INPUT_LOADED "
+        f"topic_count={len(topic_rows)} "
+        f"topic_start_index={start_index} "
+        f"limit_topics={LIMIT_TOPICS} "
+        f"use_input_urls={USE_INPUT_URLS}"
+    )
 
     config = PrefetchPipelineConfig(
         llm_model=LLM_MODEL,

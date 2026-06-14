@@ -82,6 +82,9 @@ def normalize_url(url: str) -> str:
     normalized = re.sub(r"#.*$", "", normalized)
     return normalized.rstrip("/")
 
+
+SNIPPET_SEGMENT_SEPARATOR = "\n\n......\n\n"
+
 def _jaccard_similarity(text_a: str, text_b: str) -> float:
     return _jaccard_similarity_by_token_set(
         _content_token_set_for_dedup(text_a),
@@ -208,7 +211,7 @@ def dedup_search_candidates_by_url(candidates: list[SearchSnippetCandidate]) -> 
     deduplicated: list[SearchSnippetCandidate] = []
     for index, url in enumerate(url_order, start=1):
         merged = merged_by_url[url]
-        combined_snippet = "\n\n".join(
+        combined_snippet = SNIPPET_SEGMENT_SEPARATOR.join(
             snippet for snippet in merged.get("snippets", []) if _normalize_whitespace(snippet)
         ).strip()
         if not combined_snippet:

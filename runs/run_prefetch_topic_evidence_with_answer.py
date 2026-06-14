@@ -36,10 +36,10 @@ from scripts.prompt_template import build_topic_grounding_evidence_extract_with_
 # All paths below are relative to project root: /home/an/Project_verification_agent
 
 INPUT_JSONL =  "response_data/question_answer/accepted.whitelist_plus_tmp_filter.id_question_answer_url_only.jsonl"
-OUTPUT_DIR = "prefetch_data/yue_question/try7_4to13"
+OUTPUT_DIR = "prefetch_data/yue_question/try15_changed_4to13"
 LLM_MODEL = "openai/gpt-5.4-nano"
 USE_INPUT_URLS = True
-REUSE_FETCHED_FULLTEXT_JSONL = "" #"prefetch_data/yue_question/try1/fetched_fulltext_pages.jsonl"  
+REUSE_FETCHED_FULLTEXT_JSONL = "prefetch_data/yue_question/try7_4to13/fetched_fulltext_pages.jsonl"  
 # e.g. "prefetch_data/yue_question/try1/fetched_fulltext_pages.jsonl"
 ENABLE_TOPIC_PARALLEL = True
 TOPIC_PARALLEL_WORKERS = 10
@@ -52,15 +52,19 @@ ANSWER_FIELD = "answer"
 ANSWER_FIELD_FALLBACKS = []
 TOPIC_ID_FIELD = "id"
 URL_FIELD = "url"
+# False means rows without `id` will be assigned fallback topic IDs like T1/T2.
+# Keep this False only for ad-hoc inputs where stable source IDs are not required;
+# set it to True when output must preserve input IDs for reuse, trace comparison, or joins.
 REQUIRE_TOPIC_ID_FROM_INPUT = True
 REQUIRE_ANSWER_FROM_INPUT = True
 TOPIC_START_INDEX = 3  # 0-based inclusive start index; the row at this index is included in the run.
 LIMIT_TOPICS: int | None = 10
-#第 4 到第 6 条，配置成：TOPIC_START_INDEX = 3  LIMIT_TOPICS = 3
+# Example: to run rows 4-6 only, use TOPIC_START_INDEX = 3 and LIMIT_TOPICS = 3.
 
 WIKI_QUERY_COUNT = 3
 WEB_QUERY_COUNT = 3
 SNIPPETS_PER_QUERY = 5
+STAGE5_MAX_ATTEMPTS = 3
 
 
 def _project_root() -> Path:
@@ -69,6 +73,60 @@ def _project_root() -> Path:
 
 def _normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _extract_snippet_ids_from_text(text: str) -> list[str]:
+    found = re.findall(r"\bS\d+\b", str(text or "").upper())
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for snippet_id in found:
+        if snippet_id in seen:
+            continue
+        seen.add(snippet_id)
+        ordered.append(snippet_id)
+    return ordered
+
+
+def _validate_snippet_references(
+    *,
+    topic_brief: str,
+    answer_reasoning: str,
+    valid_snippet_ids: set[str],
+) -> None:
+    topic_brief_refs = _extract_snippet_ids_from_text(topic_brief)
+    reasoning_refs = _extract_snippet_ids_from_text(answer_reasoning)
+
+    missing_topic_brief_refs = [snippet_id for snippet_id in topic_brief_refs if snippet_id not in valid_snippet_ids]
+    missing_reasoning_refs = [snippet_id for snippet_id in reasoning_refs if snippet_id not in valid_snippet_ids]
+
+    if not missing_topic_brief_refs and not missing_reasoning_refs:
+        return
+
+    parts: list[str] = []
+    if missing_topic_brief_refs:
+        parts.append(
+            "topic_brief references missing snippet_ids: " + ", ".join(missing_topic_brief_refs)
+        )
+    if missing_reasoning_refs:
+        parts.append(
+            "answer_assessment.reasoning references missing snippet_ids: "
+            + ", ".join(missing_reasoning_refs)
+        )
+    raise RuntimeError("; ".join(parts))
+
+
+def _build_guidance_evidence_items(evidence_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    guidance_items: list[dict[str, Any]] = []
+    for item in evidence_items:
+        guidance_items.append(
+            {
+                "snippet_id": str(item.get("snippet_id") or "").strip(),
+                "source_url": str(item.get("source_url") or "").strip(),
+                "source_title": str(item.get("source_title") or "").strip(),
+                "content": str(item.get("content") or "").strip(),
+            }
+        )
+    return guidance_items
 
 
 def _call_llm_json(llm: LLMClient, system_prompt: str, user_prompt: str, *, stage_name: str) -> dict[str, Any]:
@@ -84,6 +142,18 @@ def _call_llm_json(llm: LLMClient, system_prompt: str, user_prompt: str, *, stag
         return parsed
     except Exception as exc:
         raise RuntimeError(f"{stage_name}_llm_parse_failed: {exc}") from exc
+
+
+def _validate_stage5_payload(llm_json: dict[str, Any]) -> None:
+    evidence_items = llm_json.get("evidence_items")
+    topic_brief = llm_json.get("topic_brief")
+    answer_assessment = llm_json.get("answer_assessment")
+    if not isinstance(evidence_items, list):
+        raise RuntimeError("stage5_missing_or_invalid_evidence_items")
+    if not isinstance(topic_brief, str):
+        raise RuntimeError("stage5_missing_or_invalid_topic_brief")
+    if not isinstance(answer_assessment, dict):
+        raise RuntimeError("stage5_missing_or_invalid_answer_assessment")
 
 
 def _read_topic_rows(input_jsonl: Path, use_input_urls: bool) -> list[dict[str, Any]]:
@@ -145,15 +215,10 @@ def _progress(message: str) -> None:
         print(f"[prefetch-answer] {message}", flush=True)
 
 
-def _prepare_output_dir_and_check_conflicts(output_dir: Path, conflict_policy: str) -> None:
+def _prepare_output_dir_and_check_conflicts_for_paths(
+    output_dir: Path, conflict_policy: str, expected_output_files: list[Path]
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    expected_output_files = [
-        output_dir / "topic_grounding_with_answer.jsonl",
-        output_dir / "topic_guidance_with_answer.jsonl",
-        output_dir / "fetched_fulltext_pages.jsonl",
-        output_dir / "topic_grounding_trace_with_answer.jsonl",
-        output_dir / "run_prefetch_topic_evidence_with_answer_report.json",
-    ]
     existing_files = [path for path in expected_output_files if path.exists()]
     if not existing_files:
         return
@@ -178,6 +243,19 @@ def _prepare_output_dir_and_check_conflicts(output_dir: Path, conflict_policy: s
     raise ValueError(f"Invalid OUTPUT_CONFLICT_POLICY: {conflict_policy}. Use fail/backup/overwrite.")
 
 
+def _prepare_output_dir_and_check_conflicts(output_dir: Path, conflict_policy: str) -> None:
+    _prepare_output_dir_and_check_conflicts_for_paths(
+        output_dir,
+        conflict_policy,
+        [
+            output_dir / "topic_guidance_with_answer.jsonl",
+            output_dir / "fetched_fulltext_pages.jsonl",
+            output_dir / "topic_grounding_trace_with_answer.jsonl",
+            output_dir / "run_prefetch_topic_evidence_with_answer_report.json",
+        ],
+    )
+
+
 def _extract_evidence_with_answer_assessment(
     *,
     llm: LLMClient,
@@ -193,7 +271,6 @@ def _extract_evidence_with_answer_assessment(
     pages_for_prompt = [
         {
             "url_id": page.url_id,
-            "topic_id": page.topic_id,
             "source_url": page.source_url,
             "source_title": page.source_title,
             "candidate_ids": list(page.candidate_ids),
@@ -207,13 +284,34 @@ def _extract_evidence_with_answer_assessment(
 
     system_prompt, user_prompt = build_topic_grounding_evidence_extract_with_answer_prompt(
         {
-            "topic_id": topic_id,
             "query": query,
             "answer": answer,
             "pages": pages_for_prompt,
         }
     )
-    llm_json = _call_llm_json(llm, system_prompt, user_prompt, stage_name="stage5_extract_evidence_with_answer")
+    llm_json: dict[str, Any] | None = None
+    attempt_errors: list[str] = []
+    for attempt_index in range(1, max(1, int(STAGE5_MAX_ATTEMPTS)) + 1):
+        attempt_system_prompt = system_prompt
+        if attempt_index > 1:
+            attempt_system_prompt = (
+                "Previous output was invalid or incomplete. Return only one valid JSON object in the required schema.\n\n"
+                + system_prompt
+            )
+        try:
+            candidate_json = _call_llm_json(
+                llm,
+                attempt_system_prompt,
+                user_prompt,
+                stage_name="stage5_extract_evidence_with_answer",
+            )
+            _validate_stage5_payload(candidate_json)
+            llm_json = candidate_json
+            break
+        except RuntimeError as exc:
+            attempt_errors.append(f"attempt_{attempt_index}:{exc}")
+    if llm_json is None:
+        raise RuntimeError("; ".join(attempt_errors))
 
     valid_url_ids = {page.url_id for page in usable_pages}
     evidence_items: list[dict[str, Any]] = []
@@ -225,9 +323,8 @@ def _extract_evidence_with_answer_assessment(
 
         url_id = _normalize_whitespace(raw_item.get("url_id") or "")
         relevant_text = str(raw_item.get("relevant_text") or "").strip()
-        summary = _normalize_whitespace(raw_item.get("summary") or "")
 
-        if not url_id or url_id not in valid_url_ids or not relevant_text or not summary:
+        if not url_id or url_id not in valid_url_ids or not relevant_text:
             continue
 
         source_page = next((page for page in usable_pages if page.url_id == url_id), None)
@@ -243,9 +340,7 @@ def _extract_evidence_with_answer_assessment(
                 "source_url": source_page.source_url,
                 "source_title": source_page.source_title,
                 "source_type": source_page.source_type,
-                "relevant_text": relevant_text,
-                "summary": summary,
-                "content": f"{relevant_text}\n\nSummary: {summary}".strip(),
+                "content": relevant_text,
             }
         )
 
@@ -261,6 +356,13 @@ def _extract_evidence_with_answer_assessment(
         "is_unique_answer": bool(answer_assessment_raw.get("is_unique_answer")),
         "canonical_answer": str(answer_assessment_raw.get("canonical_answer") or "").strip(),
     }
+
+    valid_snippet_ids = {item["snippet_id"] for item in evidence_items}
+    _validate_snippet_references(
+        topic_brief=topic_brief,
+        answer_reasoning=answer_assessment["reasoning"],
+        valid_snippet_ids=valid_snippet_ids,
+    )
     return evidence_items, topic_brief, answer_assessment
 
 
@@ -321,11 +423,10 @@ class PrefetchTopicEvidenceWithAnswerPipeline:
         total_topics = len(topic_inputs)
         self._progress(f"START total_topics={total_topics} parallel={self.config.enable_topic_parallel}")
 
-        grounding_path = self.output_dir / "topic_grounding_with_answer.jsonl"
         guidance_path = self.output_dir / "topic_guidance_with_answer.jsonl"
         fetched_path = self.output_dir / "fetched_fulltext_pages.jsonl"
         trace_path = self.output_dir / "topic_grounding_trace_with_answer.jsonl"
-        self._initialize_output_files([grounding_path, guidance_path, fetched_path, trace_path])
+        self._initialize_output_files([guidance_path, fetched_path, trace_path])
 
         failed_topic_count = 0
         if self.config.enable_topic_parallel and len(topic_inputs) > 1:
@@ -344,7 +445,6 @@ class PrefetchTopicEvidenceWithAnswerPipeline:
                     try:
                         row = future.result()
                         self._append_completed_topic_row(
-                            grounding_path=grounding_path,
                             guidance_path=guidance_path,
                             fetched_path=fetched_path,
                             trace_path=trace_path,
@@ -356,7 +456,6 @@ class PrefetchTopicEvidenceWithAnswerPipeline:
                         self._progress(f"FAIL {completed}/{total_topics} topic_id={topic_id} error={type(exc).__name__}:{exc}")
                         row = self._build_failed_topic_row(topic_id=topic_id, error_text=str(exc))
                         self._append_completed_topic_row(
-                            grounding_path=grounding_path,
                             guidance_path=guidance_path,
                             fetched_path=fetched_path,
                             trace_path=trace_path,
@@ -371,7 +470,6 @@ class PrefetchTopicEvidenceWithAnswerPipeline:
                 try:
                     row = self._process_single_topic(topic)
                     self._append_completed_topic_row(
-                        grounding_path=grounding_path,
                         guidance_path=guidance_path,
                         fetched_path=fetched_path,
                         trace_path=trace_path,
@@ -383,7 +481,6 @@ class PrefetchTopicEvidenceWithAnswerPipeline:
                     self._progress(f"FAIL {completed}/{total_topics} topic_id={topic_id} error={type(exc).__name__}:{exc}")
                     row = self._build_failed_topic_row(topic_id=topic_id, error_text=str(exc))
                     self._append_completed_topic_row(
-                        grounding_path=grounding_path,
                         guidance_path=guidance_path,
                         fetched_path=fetched_path,
                         trace_path=trace_path,
@@ -395,7 +492,7 @@ class PrefetchTopicEvidenceWithAnswerPipeline:
             "topic_count": len(topic_inputs),
             "failed_topic_count": failed_topic_count,
             "external_urls_enabled": any(bool(topic.get("external_urls")) for topic in topic_inputs),
-            "topic_grounding_path": str(grounding_path),
+            "topic_grounding_path": str(guidance_path),
             "topic_guidance_path": str(guidance_path),
             "fetched_fulltext_path": str(fetched_path),
             "topic_grounding_trace_path": str(trace_path),
@@ -486,6 +583,7 @@ class PrefetchTopicEvidenceWithAnswerPipeline:
             answer=answer,
             merged_fetched_pages=merged_fetched_pages,
         )
+        guidance_evidence_items = _build_guidance_evidence_items(evidence_items)
 
         merged_fetched_rows = [_page_to_jsonable_row(page) for page in merged_fetched_pages]
         external_fetched_trace_rows = self._build_fetched_page_trace_rows(external_fetched_pages)
@@ -495,19 +593,12 @@ class PrefetchTopicEvidenceWithAnswerPipeline:
         self._progress(f"TOPIC_END topic_id={topic_id} elapsed_seconds={elapsed}")
         return {
             "topic_id": topic_id,
-            "grounding": {
-                "topic_id": topic_id,
-                "query": query,
-                "answer": answer,
-                "evidence_items": evidence_items,
-                "topic_brief": topic_brief,
-                "answer_assessment": answer_assessment,
-            },
             "guidance": {
                 "topic_id": topic_id,
                 "query": query,
                 "answer": answer,
                 "topic_guidance": topic_brief,
+                "evidence_items": guidance_evidence_items,
                 "answer_assessment": answer_assessment,
             },
             "merged_fetched_rows": merged_fetched_rows,
@@ -532,19 +623,12 @@ class PrefetchTopicEvidenceWithAnswerPipeline:
     def _build_failed_topic_row(self, *, topic_id: str, error_text: str) -> dict[str, Any]:
         return {
             "topic_id": topic_id,
-            "grounding": {
-                "topic_id": topic_id,
-                "query": "",
-                "answer": "",
-                "evidence_items": [],
-                "topic_brief": "",
-                "answer_assessment": {},
-            },
             "guidance": {
                 "topic_id": topic_id,
                 "query": "",
                 "answer": "",
                 "topic_guidance": "",
+                "evidence_items": [],
                 "answer_assessment": {},
             },
             "merged_fetched_rows": [],
@@ -590,13 +674,11 @@ class PrefetchTopicEvidenceWithAnswerPipeline:
     def _append_completed_topic_row(
         self,
         *,
-        grounding_path: Path,
         guidance_path: Path,
         fetched_path: Path,
         trace_path: Path,
         row: dict[str, Any],
     ) -> None:
-        self._append_jsonl_row(grounding_path, row["grounding"])
         self._append_jsonl_row(guidance_path, row["guidance"])
         self._append_jsonl_rows(fetched_path, row["merged_fetched_rows"])
         self._append_jsonl_row(trace_path, row["trace"])

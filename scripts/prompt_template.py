@@ -168,7 +168,7 @@ Extract explicit factual claims from the given text, splitting compound statemen
   - If multiple items share the same predicate(e.g., "X are covered by A, B and C together"), keep them together as one sentence.
 
 2. **Make all subjects explicit and self-contained**
-  - **Standalone**: Each fact must be understandable without reading other facts.
+  - **Preserve ownership/scope**: Make the source entity–fact relationship explicit in every extracted claim, even if it was only implied by the input text. Do not extract a generic claim when the fact is tied to a specific named entity.
   - **No vague references**: Replace words like "it", "this", "the former", "that" with the full entity name.
   - **Repeat full identifier**: If an entity has a specific identifier (e.g., route number, official name), include it in EVERY fact that mentions it. Do NOT write it only once and then use a generic term later.
 
@@ -190,7 +190,6 @@ Extract explicit factual claims from the given text, splitting compound statemen
 SPLIT_CLAIMS_USER_PROMPT_TEMPLATE = """
 Below are examples of decomposing a text into atomic, standalone facts.
 
-
 # Examples
 
 ## Example 1
@@ -201,6 +200,7 @@ Jensen Huang is a Taiwanese American electrical engineer.
 NVIDIA Corporation initially focused on graphics processing units.
 NVIDIA Corporation invented the GPU in 1999.
 NVIDIA Corporation’s invention of the GPU advanced the development of computer graphics.
+
 
 ## Example 2
 text: Zootopia, produced by Walt Disney Pictures, was released in 2016 and depicts a modern city where predators and prey live together in harmony. The protagonist Judy is a small rabbit police officer who actively patrols the city and investigates cases. Her persistent efforts and energetic personality make her deeply inspiring, and every worker with dreams would be moved to tears when seeing her. The film eventually won the Best Animated Feature award at the 89th Academy Awards.
@@ -214,6 +214,8 @@ Zootopia won the Best Animated Feature award at the 89th Academy Awards.
 
 
 
+
+
 ## Example 3
 text: California's diverse landscape is anchored by the Sierra Nevada mountains, which house Mount Whitney. The state is also home to Redwood National Park. While the Mojave Desert contains Death Valley, the hottest place on Earth, the shimmering heat waves there seem to dance with a cruel, poetic beauty. 
 Output:
@@ -222,6 +224,15 @@ The Sierra Nevada mountains house Mount Whitney.
 The state California is also home to Redwood National Park.
 The Mojave Desert in California contains Death Valley.
 Death Valley is the hottest place on Earth.
+
+
+## Example 4
+text: The flag of Bhutan features a dragon, which symbolizes the country’s name, “Druk Yul,” meaning “Land of the Thunder Dragon.”
+Output:
+The flag of Bhutan features a dragon.
+The dragon on the flag of Bhutan symbolizes the country’s name, “Druk Yul.”
+“Druk Yul,” as Bhutan’s country name, means “Land of the Thunder Dragon.”
+
 
 # Task
 Break down every sentence in the given text as required:
@@ -338,34 +349,33 @@ def build_group_prompt(claims: Sequence[str], prior_topic_map: Mapping[str, str]
 SNIPPET_FILTER_SYSTEM_PROMPT_TEMPLATE = """
 Your task is to filter current_round_snippets based on the inputs.
 
-
 Inputs:
 - claim: The atomic claim currently being verified.
 - response_context: The original response that contains TARGET_CLAIM. Use it only to understand what the target claim refers to.
 - current_round_snippets: search result snippets from the latest retrieval round. Each snippet contains candidate_id, url, title, and content.
 - existing_claim_snippets: snippets already collected for verifying this claim. Use them only to judge whether a current-round snippet adds new information.
 
-
-
 Outputs:
 - evidence_pool_candidate_ids: candidate_ids that can help verify (support or refute) this claim or other claims from response_context.
 - direct_relevant_candidate_ids: A subset of evidence_pool_candidate_ids that directly support, refute, or qualify the claim.
 
-
 Filtering rules:
 For each snippet in current_round_snippets:
+1. First check whether the snippet is about the right target.
+  - Use both the claim and response_context to identify the exact thing being verified, because the claim may omit context from the original response. 
+  - Continue only if the snippet’s own content clearly refers to that same thing in the same context. 
+  - Otherwise, exclude it.
 
-1. First decide whether it adds useful evidence.
+2. Then decide whether the snippet should enter the evidence pool.
    Add it to evidence_pool_candidate_ids only if both conditions are met:
    - It provides factual information that may help verify the claim or closely related claims in response_context.
    - It adds new information not already covered by existing_claim_snippets, or provides a clearly more direct, reliable, or claim-specific formulation of the same fact.
 
-2. Then decide whether it is directly relevant to the claim.
+3. Then decide whether it is directly relevant to the claim.
    Add it to direct_relevant_candidate_ids only if it directly supports, refutes, or qualifies the claim itself.
 
 Constraint:
 direct_relevant_candidate_ids must be a subset of evidence_pool_candidate_ids.
-
 
 Do not rewrite, summarize, or complete any snippet.
 Do not invent candidate IDs.
@@ -401,7 +411,7 @@ NEXT_SEARCH_OR_ANSWER_SYSTEM_PROMPT_TEMPLATE = """
 You are provided with:
 - TARGET_CLAIM: the claim that needs to be checked.
 - response_context: the original response containing TARGET_CLAIM. Use it ONLY to understand what TARGET_CLAIM refers to.
-- search_history: retrieval history by round. Each item contains the round_index, the search query used in that round, the newly retrived direct-evidence snippet ids and content using this search query.
+- search_history: retrieval history by round. Each item contains round_index, search_query, and new_evidence. Each new_evidence item contains snippet_id and text.
 - topic_guidance_for_search: guidance for understanding the topic.
 
 
@@ -448,32 +458,64 @@ Decision: `{non_factual_label}`.
 
 
 ## Step 2 — Generate a Search Query If Needed
-If Step 1 does not provide enough direct evidence to verify ALL factual elements in the TARGET_CLAIM, identify the missing factual element and create one keyword-style Google search query for it. Use the fewest words when generating the search query.
-Review each prior search query and its returned snippets. If they still leave the missing fact unresolved, treat the query direction as wrong and issue a new query targeting a different angle.
+If Step 1 does not provide enough direct evidence to verify ALL factual elements in the TARGET_CLAIM, create one keyword-style Google search query.
+
+
+
 
 **Query rules:**
-- Use core keywords only: names, nouns, domain terms, and target values. Remove extra context and low-value verbs such as “means”, “signifies”, “represents”, “occurred”, or “refers to”.
-- Search only the missing factual element, not the whole TARGET_CLAIM. Do not add unnecessary known details just because they appear in the claim.
-- Do not mix separate missing facts in one query.
-- If a similar query was already tried, shorten it to core names or terms instead of rephrasing it.
+* First decide what single fact or relationship is still missing.
+* Use search_history to choose the next search. Check what earlier queries found and missed. If they did not find the missing fact, do not just reword them. Search for a different missing part of the claim.
+* Build the query around that missing part, not the whole TARGET_CLAIM.
+* Keep any entity name needed to identify who or what the missing part belongs to.
+* Remove words that do not help retrieval.
+
 
 
 **Examples:**
+* Learn how to generate a search query when there is no useful search history:
 TARGET_CLAIM: Mutsumi Tamura is known for the role of Bojji in Ranking of Kings.
 search query: Mutsumi Tamura Bojji Ranking of Kings
 
-TARGET_CLAIM: Mia Serafino's character Mia worked for George Nakai in TV series Beef.
-search query: Mia George Nakai Beef  
+TARGET_CLAIM: Mia Serafino's character Mia worked for George Nakai in the TV series Beef.
+search query: Mia George Nakai Beef
 
-TARGET_CLAIM: The family crest depicts a falcon displayed Proper, meaning the falcon is shown in its natural colors.
-search query: heraldry Proper natural colors
+* Learn how to generate a search query from existing search_history:
+TARGET_CLAIM: The Alfa Romeo logo contains a red cross and a serpent eating a man, both symbols associated with Milan.
+search_history:
+[
+  {{
+    "round_index": 1,
+    "search_query": "Alfa Romeo logo red cross serpent",
+    "new_evidence": [
+      {{
+        "snippet_id": "S1",
+        "text": "The Alfa Romeo logo contains a red cross and a serpent eating a man."
+      }}
+    ]
+  }}
+]
+Missing part: whether the red cross and serpent eating a man in the Alfa Romeo logo are symbols associated with Milan. The logo contents are already found, so do not search them again alone.
+search query: Alfa Romeo logo Milan 
 
-TARGET_CLAIM: House Loglas has a wolf argent on its shield, in heraldry meaning the wolf is silver.
-Do not search “argent silver wolf shield.” Search one fact at a time, do not mix separate missing facts in one query: “heraldry argent silver” or “House Loglas shield wolf.”
 
-TARGET_CLAIM: In medical terminology, "chronic cough in children" means the cough lasts a long time.
-Do not search `medical terminology chronic cough in children lasts long time`.
-Search `medical terminology chronic long lasting`; the intended missing fact is the meaning of "chronic"; "children" is irrelevant to it.
+TARGET_CLAIM: The bronze masks uncovered at the Helikon sanctuary by the French-Greek excavation in 2021 date to the Classical period.
+search_history:
+[
+  {{
+    "round_index": 1,
+    "search_query": "Helikon sanctuary bronze masks French Greek excavation 2021",
+    "new_evidence": [
+      {{
+        "snippet_id": "S1",
+        "text": "A French-Greek team excavated the Helikon sanctuary in 2021 and uncovered several bronze masks."
+      }}
+    ]
+  }}
+]
+Missing part: whether the bronze masks themselves date to the Classical period. The excavation team, site, year, and discovery are already found, so do not search the whole discovery again. Keep the site name to avoid ambiguity, and search the unresolved dating relationship.
+search query: Helikon sanctuary bronze masks Classical period
+
 
 
 ## OUTPUT FORMAT:
@@ -618,7 +660,6 @@ Output requirements:
 - Each item must include:
   - url_id
   - relevant_text (a relatively long direct text segment from source page)
-  - summary(a complete summary of the relevant_text)
 - Do not fabricate facts.
 - Keep relevant_text tied to source text (do not output summary-only evidence).
 - One URL may yield multiple evidence items.
@@ -634,8 +675,7 @@ Return only valid JSON:
     {{
       "snippet_id": "S1",
       "url_id": "397_EXT_U1",
-      "relevant_text": "...",
-      "summary": "..."
+      "relevant_text": "..."
     }}
   ],
   "topic_brief": "..."
@@ -656,52 +696,56 @@ fetched_pages_with_url_id:
 
 
 TOPIC_GROUNDING_EVIDENCE_EXTRACT_WITH_ANSWER_SYSTEM_PROMPT_TEMPLATE = """
-Extract evidence from fetched full-page texts for topic-level grounding, and produce topic brief in the same output.
+Extract source-grounded evidence for a topic query, turn that evidence into human-readable retrieval guidance, and assess whether the provided answer is supported by the extracted evidence.
 
-Context:
-- The program already performed snippet dedup and LLM candidate selection.
-- The fetched pages are from URLs mapped by selected candidate_id.
-- In this variant, a proposed answer to topic_query is also provided.
+Inputs:
+- `topic_query`: the question or information need to ground.
+- `provided_answer`: the proposed answer that must be checked against the evidence.
+- `fetched_pages_with_url_id`: full-page text grouped by `url_id`. Extract evidence only from these page texts.
 
-Output requirements:
-- Return both `evidence_items` and `topic_brief`.
-- Also return `answer_assessment`.
-- Each item must include:
-  - url_id
-  - relevant_text (a relatively long direct text segment from source page)
-  - summary(a complete summary of the relevant_text)
-- Do not fabricate facts.
-- Keep relevant_text tied to source text (do not output summary-only evidence).
-- One URL may yield multiple evidence items.
-- `topic_brief` is retrieval guidance, not just direct evidence;
-- `topic_brief` should be vivid and concrete in writing.
-- Each factual statement in topic_brief must cite evidence snippet IDs like [S1].
-- Use only topic_query and extracted evidence_items.
-- Do not introduce new entities/dates/works not present in topic_query or evidence_items.
+Outputs:
+Return only the three top-level fields shown in the JSON schema:
+- `evidence_items`: direct source text snippets extracted from the fetched pages that are useful for answering or grounding `topic_query`.
+- `topic_brief`: a short evidence guide that explains the key source-backed facts needed to ground `topic_query`.
+- `answer_assessment`: a step-by-step judgment of whether `provided_answer` is supported as the answer to `topic_query`, using the same snippets cited by `topic_brief`.
 
-Answer assessment requirements:
-- `answer_assessment` evaluates whether the provided_answer is supported as an answer to topic_query.
-- Base the judgment on fetched evidence and extracted evidence_items. Use topic_brief only as a concise synthesis of the same evidence, not as an independent source.
-- `answer_assessment.reasoning` must cite evidence snippet IDs like [S1] or [S1][S2], in the same style as topic_brief.
-- `answer_assessment.reasoning` must reason step by step. Keep the wording simple and direct.
-- In the JSON object for `answer_assessment`, output `reasoning` before the boolean judgment fields.
-- Do not output a separate `supporting_snippet_ids` field.
-- Use this decision process:
-  1. State what field the question is asking for.
-  2. State what each useful snippet says for that field.
-  3. Decide whether the snippets agree, conflict, or do not directly answer that field.
-  4. Then decide `is_supported`, `is_unique_answer`, and `canonical_answer`.
-- Set `is_supported` to true only when the evidence set supports the provided_answer and no snippet gives a different value for the same field.
-- Set `is_unique_answer` to true only when the evidence set gives one answer for the asked field and no snippet gives a different value for that same field.
-- If one direct table, infobox, or award/filmography row gives the answer and the other snippets do not conflict with it, then `is_unique_answer` should usually be true.
-- If some snippet is broader, uses a different label, or talks about a related field, do not treat it as direct conflict unless it gives a different value for the same field asked by the question.
-- If the evidence does not clearly resolve one corrected answer, leave `canonical_answer` as an empty string.
+Core rules:
+- Use only `fetched_pages_with_url_id`; do not fabricate facts or use outside knowledge.
+- Each evidence item must include `snippet_id`, `url_id`, and a direct source quote in `relevant_text`.
+- In `relevant_text`, copy the source wording as much as possible. Do not rewrite it into a short summary sentence.
+- Include enough local context, such as the page/table heading, column names, surrounding sentence, or nearby rows.
+- For tables or lists, keep the relevant header and all rows needed for the answer, count, or comparison.
+- Keep the excerpt focused but complete: usually a short paragraph, or a small table/list block with headings and needed nearby rows.
+- Use snippet IDs in order: `S1`, `S2`, `S3`, and so on.
+- Every factual statement in `topic_brief` and `answer_assessment.reasoning` must cite snippet IDs like [S1] or [S1][S2].
+
+Assessment rules:
+- First identify the exact field or value type asked by `topic_query`.
+- Compare `provided_answer` only against evidence for that same field.
+- Treat evidence as conflicting only when snippets give different values for that same field.
+- Set `is_supported` true only if the evidence supports `provided_answer` and has no same-field conflict.
+- Set `is_unique_answer` true only if the evidence gives one clear answer for the asked field.
+- Use `canonical_answer` for the clear evidence-supported answer; otherwise use an empty string.
 
 Few-shot example 1:
 Query: On what date was the soundtrack released?
 Provided answer: August 10, 1995
-Snippet S1: The soundtrack was released on August 10, 1995. [S1]
-Snippet S2: The soundtrack was released on July 11, 1995. [S2]
+Snippet S1:
+Dangerous Minds: Music from the Motion Picture
+Soundtrack album by various artists
+Released: August 10, 1995
+Recorded: 1995
+Genre: Hip hop, R&B
+Label: MCA
+The album was released by MCA Records as the soundtrack for the 1995 film Dangerous Minds.
+[S1]
+Snippet S2:
+Release history
+The lead single was released before the full soundtrack album.
+Single | Release date | Label
+Title song | July 11, 1995 | MCA
+Soundtrack album | August 10, 1995 | MCA
+[S2]
 Reasoning:
 Step 1: The question asks for the soundtrack release date.
 Step 2: S1 gives August 10, 1995 for that date [S1].
@@ -722,9 +766,27 @@ Output:
 Few-shot example 2:
 Query: How many films did the actor appear in during 2022?
 Provided answer: 3
-Snippet S1: A filmography table lists three 2022 film rows. [S1]
-Snippet S2: One of those films is confirmed as a 2022 title. [S2]
-Snippet S3: Another of those films is confirmed as a 2022 title. [S3]
+Snippet S1:
+Film
+Year | Title | Role
+2021 | Eat Wheaties! | Janet Berry-Straw
+2022 | The Cellar | Keira Woods
+2022 | Bandit | Andrea
+2022 | Friday Afternoon in the Universe | Eleanor
+2023 | The Quiet Season | Rebecca
+[S1]
+Snippet S2:
+The Cellar
+The Cellar is a 2022 supernatural horror film.
+The story follows Keira Woods after her daughter mysteriously vanishes in the cellar of their new house.
+Cast: Elisha Cuthbert as Keira Woods; Eoin Macken as Brian Woods.
+[S2]
+Snippet S3:
+Bandit
+Bandit is a 2022 Canadian biographical crime film.
+The film stars Josh Duhamel, Elisha Cuthbert, Nestor Carbonell, and Mel Gibson.
+Elisha Cuthbert appears as Andrea.
+[S3]
 Reasoning:
 Step 1: The question asks for the number of 2022 films.
 Step 2: S1 directly gives three film rows for 2022 [S1].
@@ -745,9 +807,25 @@ Output:
 Few-shot example 3:
 Query: On what date did the person begin the office of Head of State?
 Provided answer: January 1, 1925
-Snippet S1: A table labeled "Head of State" gives term start as January 1, 1925. [S1]
-Snippet S2: A broader list of heads of state gives a longer tenure starting June 28, 1922. [S2]
-Snippet S3: A president table gives a term start of June 29, 1922. [S3]
+Snippet S1:
+Head of State
+The Mandate for Syria and the Lebanon used the office of Head of State before the later presidential office.
+Officeholder | Took office | Left office
+Subhi Bay Barakat al-Khalidi | January 1, 1925 | December 21, 1925
+François Pierre-Alype | February 9, 1926 | April 28, 1926
+[S1]
+Snippet S2:
+List of heads of state
+Name | Term start | Term end
+Henri Gouraud | September 1, 1920 | June 28, 1922
+Subhi Barakat | June 28, 1922 | December 21, 1925
+[S2]
+Snippet S3:
+Presidents
+President | Took office | Left office
+Subhi Barakat | June 29, 1922 | December 21, 1925
+Charles Debbas | September 1, 1926 | January 2, 1934
+[S3]
 Reasoning:
 Step 1: The question asks for the start date of the office "Head of State".
 Step 2: S1 directly gives that field: January 1, 1925 [S1].
@@ -768,8 +846,21 @@ Output:
 Few-shot example 4:
 Query: For how many years was the region administered as a fief during 1703–1784?
 Provided answer: 78
-Snippet S1: A table shows fief from 1703 to 1745, then not-fief from 1745 to 1748, then fief again from 1748 to 1784. [S1]
-Snippet S2: A second source repeats the same two fief intervals: 1703–1745 and 1748–1784. [S2]
+Snippet S1:
+Administration
+The following table summarizes changes in how the region was administered during the Ottoman period.
+Period | Status
+1703-1745 | administered as a fief
+1745-1748 | administered directly
+1748-1784 | administered as a fief
+1784-1830 | administered directly
+[S1]
+Snippet S2:
+Ottoman administration
+The region was a fief from 1703 to 1745.
+After a short period of direct administration, it was again administered as a fief from 1748 to 1784.
+The later arrangement ended in 1784, when direct administration resumed.
+[S2]
 Reasoning:
 Step 1: The question asks for the total number of years in the fief periods within 1703–1784.
 Step 2: S1 gives two fief intervals: 1703–1745 and 1748–1784, with a non-fief gap in between [S1].
@@ -791,8 +882,20 @@ Output:
 Few-shot example 5:
 Query: What is the rank number of Company X among the largest private employers in the state as of March 2019?
 Provided answer: 5
-Snippet S1: A source says Company X is in the top five employers. [S1]
-Snippet S2: Another source gives a March 2014 top-five list and includes Company X, but does not say its exact March 2019 rank. [S2]
+Snippet S1:
+Largest private employers
+Company X is one of the top five private employers in the state.
+The report discusses major private employers as of March 2019, but this paragraph does not provide a numbered rank for each company.
+It names Company X together with several other large employers.
+[S1]
+Snippet S2:
+March 2014 employers
+This older list ranks private employers by employee count in March 2014.
+Rank | Employer | Employees
+4 | Company Y | 7,400
+5 | Company X | 7,000
+6 | Company Z | 6,800
+[S2]
 Reasoning:
 Step 1: The question asks for one exact field: the rank number of Company X as of March 2019.
 Step 2: S1 only says Company X is in the top five, not that it is ranked 5th [S1].
@@ -816,8 +919,7 @@ Return only valid JSON:
     {{
       "snippet_id": "S1",
       "url_id": "397_EXT_U1",
-      "relevant_text": "...",
-      "summary": "..."
+      "relevant_text": "..."
     }}
   ],
   "topic_brief": "...",
@@ -833,6 +935,135 @@ Return only valid JSON:
 
 
 TOPIC_GROUNDING_EVIDENCE_EXTRACT_WITH_ANSWER_USER_PROMPT_TEMPLATE = """
+topic_query:
+{query}
+
+provided_answer:
+{answer}
+
+fetched_pages_with_url_id:
+{pages}
+""".strip()
+
+
+TOPIC_GROUNDING_ASSESSMENT_REVIEW_SYSTEM_PROMPT_TEMPLATE = """
+Review an existing topic grounding result and check whether its final answer assessment matches the evidence.
+
+You are given:
+- the question
+- the provided answer
+- the fetched full pages
+- the existing topic grounding result
+- the existing topic guidance result
+
+Your job is to review the existing result, not to run a new retrieval.
+
+What to check:
+1. Check whether the evidence_items and topic_brief stay close to the fetched full pages.
+2. Check whether answer_assessment.reasoning matches the evidence.
+3. Check whether answer_assessment.is_supported is correct.
+4. Check whether answer_assessment.is_unique_answer is correct.
+5. Check whether answer_assessment.canonical_answer is correct.
+
+Use this review process:
+1. State what field the question asks for.
+2. Check what the evidence_items say for that field.
+3. If needed, check the fetched full pages for missing or conflicting text.
+4. Compare that evidence with the current answer_assessment.
+5. Decide whether each label is correct.
+
+Rules:
+- Read the existing answer_assessment carefully before judging it.
+- Treat a direct conflicting value for the same field as a serious problem.
+- If the current reasoning says there is no conflict, but the evidence does show a conflict, mark the label as incorrect.
+- If the current reasoning says the answer is not unique, but the evidence gives one answer for the asked field and no conflict, mark is_unique_answer as incorrect.
+- If canonical_answer is not clearly resolved by the evidence, it should be an empty string.
+- Keep your wording simple and direct.
+
+Few-shot example 1:
+Question: How many films did the actor appear in during 2022?
+Provided answer: 3
+Existing answer_assessment:
+{{
+  "provided_answer": "3",
+  "reasoning": "Step 1: The question asks for the number of 2022 films. Step 2: S1 directly gives three film rows for 2022 [S1]. Step 3: No snippet gives a different count [S1]. Step 4: The evidence supports 3, but the answer is not unique [S1].",
+  "is_supported": true,
+  "is_unique_answer": false,
+  "canonical_answer": "3"
+}}
+Evidence summary:
+- S1 is table evidence with three 2022 film rows.
+Review:
+The reasoning itself says there is no different count. The evidence gives one count and no conflict. So is_unique_answer is incorrect and should be true.
+Output:
+{{
+  "review_verdict": "FAIL",
+  "is_supported_correct": true,
+  "is_unique_answer_correct": false,
+  "canonical_answer_correct": true,
+  "issues": [
+    "The evidence gives one 2022 film count and no conflicting count, so is_unique_answer should be true."
+  ],
+  "corrected_answer_assessment": {{
+    "is_supported": true,
+    "is_unique_answer": true,
+    "canonical_answer": "3"
+  }}
+}}
+
+Few-shot example 2:
+Question: On what date was the soundtrack released?
+Provided answer: August 10, 1995
+Existing answer_assessment:
+{{
+  "provided_answer": "August 10, 1995",
+  "reasoning": "Step 1: S1 gives August 10, 1995 [S1]. Step 2: The evidence supports the answer [S1].",
+  "is_supported": true,
+  "is_unique_answer": true,
+  "canonical_answer": "August 10, 1995"
+}}
+Evidence summary:
+- S1 says August 10, 1995.
+- S2 says July 11, 1995.
+Review:
+The evidence has two different values for the same date field. So is_supported and is_unique_answer are both incorrect. canonical_answer is also not resolved and should be empty.
+Output:
+{{
+  "review_verdict": "FAIL",
+  "is_supported_correct": false,
+  "is_unique_answer_correct": false,
+  "canonical_answer_correct": false,
+  "issues": [
+    "The evidence contains two different release dates for the same field, so is_supported should be false.",
+    "The evidence contains two different release dates for the same field, so is_unique_answer should be false.",
+    "The corrected answer is not clearly resolved, so canonical_answer should be empty."
+  ],
+  "corrected_answer_assessment": {{
+    "is_supported": false,
+    "is_unique_answer": false,
+    "canonical_answer": ""
+  }}
+}}
+
+Return only valid JSON:
+{{
+  "review_verdict": "PASS",
+  "is_supported_correct": true,
+  "is_unique_answer_correct": true,
+  "canonical_answer_correct": true,
+  "issues": [
+    "short issue text"
+  ],
+  "corrected_answer_assessment": {{
+    "is_supported": true,
+    "is_unique_answer": true,
+    "canonical_answer": ""
+  }}
+}}
+""".strip()
+
+
+TOPIC_GROUNDING_ASSESSMENT_REVIEW_USER_PROMPT_TEMPLATE = """
 topic_id:
 {topic_id}
 
@@ -842,8 +1073,14 @@ topic_query:
 provided_answer:
 {answer}
 
-fetched_pages_with_url_id:
+fetched_fulltext_pages_with_url_id:
 {pages}
+
+topic_grounding_result:
+{grounding}
+
+topic_guidance_result:
+{guidance}
 """.strip()
 
 
@@ -856,23 +1093,28 @@ MUST_HAVE_ANSWER_SYSTEM_PROMPT_TEMPLATE = """
 You are provided with:
 - TARGET_CLAIM: the claim that needs to be checked.
 - response_context: the original response containing TARGET_CLAIM. Use it ONLY to understand what TARGET_CLAIM refers to.
-- present_snippets: the evidence collected so far. Use it to decide whether TARGET_CLAIM is supported or contradicted.
+- present_snippets: the evidence collected so far. Use it to decide whether TARGET_CLAIM is supported or contradicted. 
+- searched_queries: the search queries already tried for TARGET_CLAIM. Use them only to judge retrieval coverage and whether present_snippets reached the right evidence area. 
 - topic_guidance_for_search: guidance for understanding the topic.
 
 ## Task
 Based on the present_snippets, you should return a final answer: `{factual_label}`, `{non_factual_label}`, or `{nei_label}`.
+Use present_snippets as the only factual evidence. Use searched_queries only to understand what retrieval directions have already been attempted.
 
 
 ## Decision rules
 Before deciding, identify all factual elements in the TARGET_CLAIM.
 
-Return `{factual_label}` only if present_snippets directly support every factual elements in the TARGET_CLAIM.
+* Return `{factual_label}` only if present_snippets directly support every factual elements in the TARGET_CLAIM.
 
-Return `{non_factual_label}` if:
-- present_snippets directly contradict at least one factual elements in TARGET_CLAIM. 
-- present_snippets have reached the right area of evidence for TARGET_CLAIM, but at least one detail in the claim is still not directly supported. This includes cases where support is missing, vague, only indirectly related, or requires inference.
+* Return {non_factual_label} if the snippets are about the right target in the right context, but do not fully support the claim.
+This includes two cases:
+  - A snippet directly states a different value from the claim.
+  - The snippets cover the right evidence area after enough varied searches, but a required detail is still missing, vague, indirect, or only inferable.
 
-Return `{nei_label}` only if present_snippets have not reached the right area of evidence, such as when they discuss another entity, another event, another term, or another relation. 
+* Return {nei_label} only if the snippets do not give a fair basis for judging the claim.
+  This means the evidence is still off-target or too weak to conclude, such as snippets about a different target, the wrong context, or results from repeated searches that never reached the relevant evidence area.
+
 
 
 ## Common error to avoid:
@@ -932,6 +1174,9 @@ response_context:
 
 topic_guidance_for_search:
 {topic_guidance}
+
+searched_queries:
+{searched_queries}
 
 present_snippets_with_ids:
 {present_snippets_with_ids}
@@ -999,7 +1244,7 @@ def build_next_search_or_answer_prompt(next_input: Mapping[str, Any]) -> tuple[s
     Required input fields:
     - claim: str
     - response_context: str
-    - search_history: list[dict] with round_index/search_query/newly_added_present_snippet_ids/newly_added_present_snippets
+    - search_history: list[dict] with round_index/search_query/new_evidence
     """
     claim = str(next_input.get(FIELD_CLAIM) or "").strip()
     response_context = _get_disambiguation_text(next_input)
@@ -1089,16 +1334,33 @@ def build_topic_grounding_evidence_extract_prompt(payload: Mapping[str, Any]) ->
 
 
 def build_topic_grounding_evidence_extract_with_answer_prompt(payload: Mapping[str, Any]) -> tuple[str, str]:
-    topic_id = str(payload.get("topic_id") or "").strip()
     query = str(payload.get("query") or "").strip()
     answer = str(payload.get("answer") or "").strip()
     pages = payload.get("pages") or []
     system_prompt = TOPIC_GROUNDING_EVIDENCE_EXTRACT_WITH_ANSWER_SYSTEM_PROMPT_TEMPLATE
     user_prompt = TOPIC_GROUNDING_EVIDENCE_EXTRACT_WITH_ANSWER_USER_PROMPT_TEMPLATE.format(
+        query=query,
+        answer=answer,
+        pages=json.dumps(list(pages), ensure_ascii=False, indent=2),
+    )
+    return system_prompt, user_prompt
+
+
+def build_topic_grounding_assessment_review_prompt(payload: Mapping[str, Any]) -> tuple[str, str]:
+    topic_id = str(payload.get("topic_id") or "").strip()
+    query = str(payload.get("query") or "").strip()
+    answer = str(payload.get("answer") or "").strip()
+    pages = payload.get("pages") or []
+    grounding = payload.get("grounding") or {}
+    guidance = payload.get("guidance") or {}
+    system_prompt = TOPIC_GROUNDING_ASSESSMENT_REVIEW_SYSTEM_PROMPT_TEMPLATE
+    user_prompt = TOPIC_GROUNDING_ASSESSMENT_REVIEW_USER_PROMPT_TEMPLATE.format(
         topic_id=topic_id,
         query=query,
         answer=answer,
         pages=json.dumps(list(pages), ensure_ascii=False, indent=2),
+        grounding=json.dumps(dict(grounding), ensure_ascii=False, indent=2),
+        guidance=json.dumps(dict(guidance), ensure_ascii=False, indent=2),
     )
     return system_prompt, user_prompt
 
@@ -1116,11 +1378,13 @@ def build_must_have_answer_prompt(must_input: Mapping[str, Any]) -> tuple[str, s
     Required input fields:
     - claim: str
     - response_context: str
+    - searched_queries: list[str]
     - present_snippets_with_ids: list[dict] with snippet_id/url/title/content
     """
     claim = str(must_input.get(FIELD_CLAIM) or "").strip()
     response_context = _get_disambiguation_text(must_input)
     topic_guidance = str(must_input.get("topic_guidance") or "").strip()
+    searched_queries = must_input.get(FIELD_SEARCHED_QUERIES) or []
     present_snippets_with_ids = must_input.get(FIELD_PRESENT_SNIPPETS_WITH_IDS) or []
 
     system_prompt = MUST_HAVE_ANSWER_SYSTEM_PROMPT_TEMPLATE.format(
@@ -1132,6 +1396,7 @@ def build_must_have_answer_prompt(must_input: Mapping[str, Any]) -> tuple[str, s
         claim=claim,
         response_context=response_context,
         topic_guidance=topic_guidance,
+        searched_queries=json.dumps(list(searched_queries), ensure_ascii=False, indent=2),
         present_snippets_with_ids=json.dumps(
             list(present_snippets_with_ids),
             ensure_ascii=False,

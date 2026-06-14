@@ -32,13 +32,13 @@ from scripts.llm_api import LLMClient
 # [ONLY PLACE TO EDIT BUSINESS PARAMS]
 # =========================
 INPUT_MODE = "model_jsonl"  # 输入文件格式: 仅支持 model_jsonl；rubrics请用 run_simpleqa_rubrics_from_evidence.py
-INPUT_PATH = Path("response_data/benchmark_10_5/simpleqa_model_answers_10_5.jsonl")  # 输入文件路径(相对项目根目录)
+INPUT_PATH = Path("response_data/benchmark_10_5/simpleqa_model_answers_10_5_answer_contains_reference.jsonl")  # 输入文件路径(相对项目根目录)
 # INPUT_PATH = Path("response_data/collected_30_5/claude-sonnet-4.6_30_5.jsonl")  # 输入文件路径(相对项目根目录)
 # INPUT_PATH = Path("response_data/chinese10_english10/bilingual_benchmark_data.jsonl") 
 START_LINE = 1 # 从输入文件第几行开始跑(1-based)
-NUM_LINES = 10 # 本次最多跑多少行
-OUTPUT_BASE_DIR = Path("clean_split_retrive_data/try")  # 输出根目录(每次run会在这里建一个子目录)
-RUN_NAME = "try52_small"  # 本次run目录名; 留空则自动用输入文件名(去后缀)
+NUM_LINES = 9 # 本次最多跑多少行
+OUTPUT_BASE_DIR = Path("clean_split_retrive_data/try_selected")  # 输出根目录(每次run会在这里建一个子目录)
+RUN_NAME = "try1"  # 本次run目录名; 留空则自动用输入文件名(去后缀)
 
 # 如果要恢复上一次跑到一半的任务，保持同一个 RUN_NAME 直接再跑即可
 # 如果想强制全量重跑，把 RETRY_ONLY_ERRORS = False，或者换一个新的 RUN_NAME
@@ -56,11 +56,12 @@ INPUT_FIELD_CANDIDATES = {
 }
 
 RUN_TARGET_STAGE = "retrieve"  # clean|split|retrieve
-REUSE_FROM_STAGE = "split"  # none|clean|split|retrieve
+REUSE_FROM_STAGE = "none"  # none|clean|split|retrieve
 RETRY_ONLY_ERRORS = True  # 若已有 clean/split 输出，则只重跑 error 项并回填
 
-EXISTING_TOPIC_GROUNDING_PATH = Path("prefetch_data/topics_10/output_with_urls_6/topic_grounding.jsonl")
-EXISTING_TOPIC_GUIDANCE_PATH = Path("prefetch_data/topics_10/output_with_urls_6/topic_guidance.jsonl")
+EXISTING_TOPIC_GROUNDING_PATH = Path("prefetch_data/topics_select/try_all/topic_grounding.jsonl")
+EXISTING_TOPIC_GUIDANCE_PATH = Path("prefetch_data/topics_select/try_all/topic_guidance.jsonl")
+
 
 #44是11～21
 #29是1~11
